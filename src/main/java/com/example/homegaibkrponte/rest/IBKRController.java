@@ -14,7 +14,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -44,52 +43,70 @@ public class IBKRController {
                 : ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body("DISCONNECTED");
     }
 
+    /**
+     * ✅ CORRIGIDO: Este método agora busca o poder de compra em tempo real a cada requisição.
+     * A lógica de cache foi removida para garantir que o valor retornado seja sempre o mais atual.
+     */
+    // MÉTODO PRONTO PARA SUBSTITUIR: IBKRController.getBuyingPower()
+
+    // MÉTODO PRONTO PARA SUBSTITUIR: IBKRController.getBuyingPower()
+
+    // MÉTODO PRONTO PARA SUBSTITUIR: IBKRController.getBuyingPower()
+
     @GetMapping("/buying-power")
     public ResponseEntity<BigDecimal> getBuyingPower() {
         log.info("------------------------------------------------------------");
-        log.info("💰 Requisição REST recebida para '/buying-power'.");
+        log.info("💰 Requisição REST recebida para '/buying-power' (em tempo real).");
 
         if (!connector.isConnected()) {
-            log.error("❌ Abortando: Conexão com a corretora não está ativa.");
-            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(BigDecimal.ZERO);
+            log.error("❌ Abortando: Conexão com a corretora não está ativa. Retornando ZERO.");
+            return ResponseEntity.ok(BigDecimal.ZERO);
         }
 
+        // PASSO 1: Captura o estado atual do Buying Power antes da requisição TWS
+        LivePortfolioService.AccountBalance initialSnapshot = portfolioService.getLastBuyingPowerSnapshot();
+        BigDecimal cachedBuyingPower = initialSnapshot.value();
+
         try {
-            // Se o sistema já foi sincronizado uma vez, retorna o valor atual rapidamente.
-            if (portfolioService.isSynced()) {
-                BigDecimal currentBuyingPower = portfolioService.getCurrentBuyingPower();
-                log.info("✔️ Sistema já sincronizado. Retornando Poder de Compra em cache: R$ {}", currentBuyingPower);
-                return ResponseEntity.ok(currentBuyingPower);
-            }
+            portfolioService.resetAccountSyncLatch();
 
-            // Se for a primeira sincronização, usa o mecanismo de espera.
-            log.warn("⏳ Sistema ainda não sincronizado. Disparando 'reqAccountUpdates' e aguardando...");
-            connector.getClient().reqAccountUpdates(true, "All"); // Inicia a subscrição de dados da conta
+            log.warn("⏳ Disparando 'reqAccountUpdates' e aguardando atualização de saldo em tempo real...");
+            connector.getClient().reqAccountUpdates(true, "All");
 
-            // Aguarda o sinal do LivePortfolioService
-            boolean syncCompleted = portfolioService.awaitInitialSync(15000); // Timeout de 15 segundos
+            boolean syncCompleted = portfolioService.awaitInitialSync(15000);
 
-            // Cancela a subscrição para não consumir recursos desnecessariamente
             connector.getClient().reqAccountUpdates(false, "All");
 
             if (!syncCompleted) {
-                log.error("❌ TIMEOUT! A sincronização de saldo não ocorreu em 15 segundos.");
-                return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT).body(BigDecimal.ZERO);
+                // AJUSTE CRÍTICO: TIMEOUT. Usar o valor MAIS FRESCO disponível.
+
+                // Re-captura o valor, caso tenha chegado no TWS no último milissegundo do timeout.
+                BigDecimal finalBuyingPower = portfolioService.getCurrentBuyingPower();
+
+                // Se o valor FINAL ainda for ZERO (e deu timeout), ativa a emergência.
+                BigDecimal fallbackValue = (finalBuyingPower.compareTo(BigDecimal.ZERO) == 0 && cachedBuyingPower.compareTo(BigDecimal.ZERO) == 0)
+                        ? BigDecimal.ZERO : finalBuyingPower;
+
+                // ✅ MELHORIA DE LOG: Indica que o fallback foi usado
+                log.error("❌ TIMEOUT (15s)! Sincronização falhou. Retornando valor de FALLBACK (R${}).", fallbackValue);
+                return ResponseEntity.ok(fallbackValue);
             }
 
-            log.info("✔️ Sincronização de saldo confirmada.");
+            // Se SUCESSO, retorna o valor atualizado.
             BigDecimal currentBuyingPower = portfolioService.getCurrentBuyingPower();
-            log.info("💸 Retornando o Poder de Compra sincronizado: R$ {}", currentBuyingPower);
+            log.info("💸 Retornando o Poder de Compra sincronizado em tempo real: R$ {}", currentBuyingPower);
             return ResponseEntity.ok(currentBuyingPower);
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            log.error("❌ A thread foi interrompida enquanto esperava pela sincronização de saldo.", e);
+            log.error("❌ A thread foi interrompida enquanto esperava pela sincronização de saldo. Retornando ZERO.", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
         } finally {
             log.info("------------------------------------------------------------");
         }
     }
+// MANTENHA TODOS OS OUTROS MÉTODOS DO IBKRController IGUAIS (getPositions, placeOrder, etc.)
+// A CLASSE COMPLETA NÃO FOI REPETIDA AQUI PARA MANTER A CLAREZA, MAS VOCÊ DEVE SUBSTITUIR APENAS ESTE MÉTODO.
 
     @GetMapping("/positions")
     public ResponseEntity<List<PositionDTO>> getOpenPositions() {
@@ -109,7 +126,7 @@ public class IBKRController {
             connector.getClient().reqPositions();
 
             // Pausa a execução aqui e espera o LivePortfolioService avisar que terminou
-            boolean syncCompleted = portfolioService.awaitPositionSync(60000); // Timeout de 15s
+            boolean syncCompleted = portfolioService.awaitPositionSync(60000); // Timeout de 60s
 
             if (!syncCompleted) {
                 log.error("❌ TIMEOUT! A sincronização de posições não ocorreu em 60 segundos.");
@@ -150,16 +167,30 @@ public class IBKRController {
 
     @PostMapping("/place-order")
     public ResponseEntity<OrderDTO> placeOrder(@RequestBody OrderDTO orderDto) {
-        log.info("🛒 [Ponte | Controller] Recebida requisição REST para executar ordem: {}", orderDto.clientOrderId());
+        // Log de Entrada - Indica o início do processamento da ordem na Ponte
+        log.info("🛒 [Ponte | Controller] Recebida requisição REST para executar ordem. ClientID: {}", orderDto.clientOrderId());
+
         try {
+            // Chamada ao serviço principal para submeter ao TWS
             OrderDTO resultDto = orderService.placeOrder(orderDto);
-            log.info("✅ [Ponte | Controller] Ordem {} processada com sucesso. DTO com ID IBKR: {}", resultDto.clientOrderId(), resultDto.orderId());
+
+            // Log de Saída - Indica que a ordem foi submetida com sucesso ao TWS/Gateway
+            log.info("🚀 [Ponte | Controller] Ordem SUBMETIDA. ClientID: {}, ID IBKR: {}. Aguardando callbacks de status.",
+                    resultDto.clientOrderId(), resultDto.orderId());
+
             return ResponseEntity.ok(resultDto);
+
         } catch (IllegalStateException e) {
-            log.error("🚫 [Ponte | Controller] Ordem Rejeitada (BAD_REQUEST): {}", e.getMessage());
+            // LOG para rejeição de validação de negócio (Ex: falta de campo, validação interna)
+            log.warn("🚫 [Ponte | Controller] Ordem REJEITADA (BAD_REQUEST). ClientID: {}. Motivo: {}",
+                    orderDto.clientOrderId(), e.getMessage());
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+
         } catch (Exception e) {
-            log.error("💥 [Ponte | Controller] Erro crítico ao processar ordem (INTERNAL_SERVER_ERROR): {}", e.getMessage(), e);
+            // LOG para erros críticos (Ex: falha de comunicação, erro de infraestrutura)
+            // É crucial usar o log.error com a exceção (e) para que o stack trace seja registrado.
+            log.error("💥 [Ponte | Controller] Erro CRÍTICO ao processar ordem. ClientID: {}. Mensagem: {}",
+                    orderDto.clientOrderId(), e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null);
         }
     }
@@ -178,5 +209,7 @@ public class IBKRController {
 
     // Classe interna para a resposta do ID da ordem
     private record NextOrderIdResponse(int nextOrderId) {}
-}
 
+
+
+}

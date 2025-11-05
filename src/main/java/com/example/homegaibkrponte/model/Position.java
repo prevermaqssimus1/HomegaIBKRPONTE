@@ -2,6 +2,7 @@ package com.example.homegaibkrponte.model;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Builder;
 import lombok.Getter;
 import lombok.ToString;
 
@@ -11,6 +12,7 @@ import java.util.Optional;
 
 @Getter
 @ToString
+@Builder(toBuilder = true)
 public final class Position {
 
     private final String symbol;

@@ -2,9 +2,10 @@ package com.example.homegaibkrponte.factory;
 
 import com.example.homegaibkrponte.connector.IBKRConnector;
 import com.example.homegaibkrponte.dto.OrderDTO;
-import com.example.homegaibkrponte.model.OrderType;
 import com.ib.client.Order;
 import com.ib.client.Decimal;
+import com.ib.client.OrderType;
+import com.ib.client.Types;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -18,6 +19,7 @@ import java.util.Optional;
 public class OrderFactory {
 
     private final IBKRConnector connector;
+    private static final double PRICE_ZERO = 0.0; // Valor que o TWS espera para Market Orders
 
     public OrderFactory(IBKRConnector connector) {
         this.connector = connector;
@@ -32,50 +34,50 @@ public class OrderFactory {
 
         // 1. Mapeamento Básico de Fields
         ibkrOrder.orderId(Integer.parseInt(ibkrClientOrderId));
+        // Note: A conversão para Decimal.get(BigDecimal) é usada para quantidades maiores que Double.MAX_VALUE
         ibkrOrder.totalQuantity(Decimal.get(dto.quantity()));
 
-        // CORREÇÃO TIPAGEM: Usar BigDecimal.ZERO como fallback para lmtPrice
-        ibkrOrder.lmtPrice(Optional.ofNullable(dto.price()).orElse(BigDecimal.ZERO).doubleValue());
-
-        // 2. Mapeamento CRÍTICO: Ação e Tipo (AGORA COMPILA)
+        // 2. Mapeamento CRÍTICO: Ação e Tipo
         ibkrOrder.action(dto.type().getSide().name());
 
-        // ⚠️ CORREÇÃO Alias: Usando o FQN (com.ib.client.OrderType)
+        // 3. Mapeamento CRÍTICO do Tipo de Ordem e Preços (Onde o erro INACTIVE ocorre)
         com.ib.client.OrderType ibkrType = determineIbkrOrderType(dto.type());
         ibkrOrder.orderType(ibkrType.name());
 
-        // 3. Mapeamento de Stop Loss/Take Profit (para ordens FILHAS do Bracket)
+        if (ibkrType == OrderType.MKT) {
+            // ✅ CORREÇÃO CRÍTICA: Para MKT, o preço e o preço auxiliar DEVEM ser zero.
+            ibkrOrder.lmtPrice(PRICE_ZERO);
+            ibkrOrder.auxPrice(PRICE_ZERO);
+        } else if (ibkrType == OrderType.LMT) {
+            // Para ordens LIMIT, usa o preço do DTO (que o robô calculou).
+            ibkrOrder.lmtPrice(Optional.ofNullable(dto.price()).orElse(BigDecimal.ZERO).doubleValue());
+        }
+
+        // 4. Mapeamento de Stop Loss/Take Profit (para ordens FILHAS do Bracket)
+        // Note: Esta lógica é para ordens de Resgate/Saída (SELL MKT), e não para ordens filhas de Bracket.
         if (dto.isStopLoss()) {
             ibkrOrder.orderType(com.ib.client.OrderType.STP.name());
-            // CORREÇÃO TIPAGEM: Usar BigDecimal.ZERO como fallback para auxPrice
             ibkrOrder.auxPrice(Optional.ofNullable(dto.stopLossPrice()).orElse(BigDecimal.ZERO).doubleValue());
         } else if (dto.isTakeProfit()) {
             ibkrOrder.orderType(com.ib.client.OrderType.LMT.name());
-            // CORREÇÃO TIPAGEM: Usar BigDecimal.ZERO como fallback para lmtPrice (do TP)
             ibkrOrder.lmtPrice(Optional.ofNullable(dto.takeProfitPrice()).orElse(BigDecimal.ZERO).doubleValue());
         }
 
-        // 4. Configurações de Risco/Sessão (Boas Práticas)
+        // 5. Configurações de Risco/Sessão (CRÍTICO: Conta)
         ibkrOrder.tif("GTC");
         ibkrOrder.outsideRth(true);
-        ibkrOrder.account(connector.getAccountId()); // Chama o método corrigido!
+        // ✅ CORREÇÃO: Garante que o accountId correto seja enviado para a ordem.
+        ibkrOrder.account(connector.getAccountId());
 
         return ibkrOrder;
     }
 
-    // ----------------------------------------------------
-    // MÉTODOS DE CONVERSÃO INTERNA (SRP)
-    // ----------------------------------------------------
-
-    /**
-     * Mapeia nosso OrderType (Ponte) para o OrderType nativo da IBKR.
-     */
-    private com.ib.client.OrderType determineIbkrOrderType(OrderType orderType) {
+    private com.ib.client.OrderType determineIbkrOrderType(com.example.homegaibkrponte.model.OrderType orderType) {
         return switch (orderType) {
             case BUY_MARKET, SELL_MARKET -> com.ib.client.OrderType.MKT;
             case STOP_LOSS, SELL_STOP_LOSS, BUY_STOP, SELL_STOP -> com.ib.client.OrderType.STP;
             case TAKE_PROFIT, SELL_TAKE_PROFIT, BUY_LIMIT, SELL_LIMIT -> com.ib.client.OrderType.LMT;
-            default -> com.ib.client.OrderType.MKT; // Padrão
+            default -> com.ib.client.OrderType.MKT;
         };
     }
 }

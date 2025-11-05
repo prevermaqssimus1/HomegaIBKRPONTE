@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -26,25 +27,49 @@ public class OrderService {
 
     /**
      * Ponto de entrada para receber ordens via REST.
-     * O retorno é OrderDTO para que o Principal possa extrair o ID.
      */
     public OrderDTO placeOrder(OrderDTO orderDto) {
         if (!connector.isConnected()) {
+            log.warn("⚠️ [Ponte | ORDER-SERVICE] TWS/Gateway está DESCONECTADO. Não é possível processar a ordem {}.", orderDto.clientOrderId());
             throw new IllegalStateException("Não é possível enviar ordem: Desconectado do TWS/Gateway.");
         }
 
-        log.info("⚙️ [Ponte | ORDER-SERVICE] Recebendo ordem {}: {}", orderDto.clientOrderId(), orderDto.symbol());
+        // Log de Entrada (SINERGIA: Usando rationale para o 'SINAL' do Domínio Principal)
+        // O campo 'rationale' (Justificativa) geralmente carrega a estratégia (ex: LIMIT_STRATEGY_SIGNAL)
+        // Usamos orderDto.type() para o Tipo de Ordem IBKR (LMT, MKT)
+        log.info("⚙️ [Ponte | ORDER-SERVICE] Recebendo ordem {}. Ativo: {}, SINAL: {}, Tipo IBKR: {}.",
+                orderDto.clientOrderId(),
+                orderDto.symbol(),
+                orderDto.rationale(), // <--- USANDO RATIONALE/SINAL PARA RASTREAMENTO
+                orderDto.type());     // <--- USANDO TYPE PARA TIPO DE ORDEM IBKR
 
-        if (orderDto.isBracketOrder()) {
-            return handleBracketOrder(orderDto);
+        try {
+            if (orderDto.isBracketOrder()) {
+                log.info("➡️ [Ponte | ORDER-SERVICE] Decisão: BRACKET ORDER (Ordem Mãe + SL/TP). Processando...");
+                return handleBracketOrder(orderDto);
+            }
+
+            log.info("➡️ [Ponte | ORDER-SERVICE] Decisão: ORDEM SIMPLES ({}) para {}. Processando...",
+                    orderDto.type(), // Usando o tipo IBKR para a decisão
+                    orderDto.symbol());
+            return handleSimpleOrder(orderDto);
+
+        } catch (IllegalStateException e) {
+            log.warn("🚫 [Ponte | ORDER-SERVICE] Ordem {} REJEITADA por falha de validação estrutural: {}",
+                    orderDto.clientOrderId(), e.getMessage());
+            throw e;
+
+        } catch (Exception e) {
+            log.error("💥 [Ponte | ORDER-SERVICE] Erro CRÍTICO ao submeter ordem {} de {}. Falha na comunicação ou mapeamento.",
+                    orderDto.clientOrderId(), orderDto.symbol(), e);
+            throw new RuntimeException("Falha ao processar a ordem na Ponte: " + e.getMessage(), e);
         }
-
-        return handleSimpleOrder(orderDto);
     }
-
     // --- LÓGICA ATÔMICA BRACKET ORDER (Fase 9) ---
 
     private OrderDTO handleBracketOrder(OrderDTO masterOrderDto) {
+        // ... (Validações de Estrutura: 1, 2) e (Geração de IDs: 3) e (Configuração OCO/Parent: 4) ...
+        // (Assumindo que os passos 1 a 4 acima estão no corpo do método)
 
         // 1. Validação (Apenas da estrutura)
         if (masterOrderDto.childOrders().size() != 2) {
@@ -52,7 +77,7 @@ public class OrderService {
             throw new IllegalStateException("Ordem Composta inválida. Esperado 2 ordens filhas, recebido: " + masterOrderDto.childOrders().size());
         }
 
-        // 2. Separação dos DTOs
+        // 2. Separação dos DTOs (Uso de get para evitar Optional.get() e forçar a exceção)
         OrderDTO slDto = masterOrderDto.childOrders().stream()
                 .filter(OrderDTO::isStopLoss).findFirst()
                 .orElseThrow(() -> new IllegalStateException("SL Order faltando."));
@@ -87,34 +112,40 @@ public class OrderService {
 
         // 5. ENVIO ATÔMICO
         try {
+            // Preparação para envio
             parentOrder.transmit(false);
             slOrder.transmit(false);
             tpOrder.transmit(true);
+
+            // Log de ENTRADA DA VENDA/COMPRA (Mãe)
+            log.info("🚀 [Ponte | EXEC-BRACKET] Iniciando envio da Mestra ({}) com ID IBKR {}. Ação: {}, Tipo: {}.",
+                    masterOrderDto.symbol(), masterOrderId, parentOrder.action(), parentOrder.orderType());
 
             connector.getClient().placeOrder(masterOrderId, contract, parentOrder);
             connector.getClient().placeOrder(slOrderId, contract, slOrder);
             connector.getClient().placeOrder(tpOrderId, contract, tpOrder);
 
-            // 💡 AJUSTE CRÍTICO (SINERGIA/IMUTABILIDADE): Cria NOVOS DTOs com os IDs preenchidos.
-
-            // 6. Atualiza as filhas com o ID da IBKR
+            // 6. Atualiza as filhas com o ID da IBKR (Imutabilidade)
             OrderDTO updatedSlDto = slDto.withOrderId(slOrderId);
             OrderDTO updatedTpDto = tpDto.withOrderId(tpOrderId);
             List<OrderDTO> updatedChildOrders = List.of(updatedSlDto, updatedTpDto);
 
             // 7. Cria o DTO Mestra final com o ID da Mestra e a nova lista de filhos.
-            // (Isto requer o uso do construtor ou helper 'withOrderId' e um helper para 'withChildOrders' no Record)
             OrderDTO finalResultDto = masterOrderDto
-                    .withOrderId(masterOrderId) // Atualiza o ID da ordem mestra
-                    .withChildOrders(updatedChildOrders); // Assume o helper para atualizar a lista de filhos
+                    .withOrderId(masterOrderId)
+                    .withChildOrders(updatedChildOrders);
 
-            log.info("✅ [Ponte | EXEC-BRACKET] Ordem Bracket atômica enviada para {}. Mestra ID: {}. Retornando DTO com IDs.", masterOrderDto.symbol(), masterOrderId);
+            // Log de RETORNO (Sucesso na submissão ao TWS)
+            log.info("✅ [Ponte | EXEC-BRACKET] Ordem Bracket atômica SUBMETIDA para {}. Mestra ID: {}. Retornando DTO com IDs.",
+                    masterOrderDto.symbol(), masterOrderId);
 
             // Retorna o DTO final, imutável e completo.
             return finalResultDto;
 
         } catch (Exception e) {
-            log.error("❌ [Ponte | API-IBKR] Falha CRÍTICA ao enviar Bracket Order para {}. Detalhes: {}", masterOrderDto.symbol(), e.getMessage(), e);
+            // try-catch para rastrear o que acontece no código
+            log.error("❌ [Ponte | API-IBKR] Falha CRÍTICA ao enviar Bracket Order para {}. ID Mestra: {}. Mensagem: {}",
+                    masterOrderDto.symbol(), masterOrderId, e.getMessage(), e);
             throw new RuntimeException("Erro ao enviar Bracket Order para a IBKR: " + e.getMessage(), e);
         }
     }
@@ -130,23 +161,26 @@ public class OrderService {
         Order ibkrOrder = orderFactory.create(orderDto, String.valueOf(ibkrOrderId));
 
         try {
-            log.info("Validação OK. Enviando ordem simples para o TWS: ID {}, Tipo {}, Ativo {}",
-                    ibkrOrderId, ibkrOrder.orderType(), contract.symbol());
+            // Log de ENTRADA DA VENDA/COMPRA
+            log.info("🚀 [Ponte | EXEC-SIMPLES] Enviando ordem SIMPLES para TWS. ID IBKR: {}, Ação: {}, Tipo: {}, Ativo: {}.",
+                    ibkrOrderId, ibkrOrder.action(), ibkrOrder.orderType(), contract.symbol());
 
             connector.getClient().placeOrder(ibkrOrderId, contract, ibkrOrder);
 
-            // 💡 AJUSTE CRÍTICO (SINERGIA/IMUTABILIDADE): Cria um NOVO DTO
-            // com o ID da IBKR preenchido, mantendo a imutabilidade do Record.
+            // 3. Cria um NOVO DTO com o ID da IBKR preenchido (Imutabilidade)
             OrderDTO resultDto = orderDto.withOrderId(ibkrOrderId);
 
-            log.info("✅ [Ponte | ORDER-SERVICE] Ordem {} ({}) enviada com sucesso ao TWS. Retornando DTO com ID IBKR: {}",
+            // Log de RETORNO (Sucesso na submissão ao TWS)
+            log.info("✅ [Ponte | ORDER-SERVICE] Ordem Simples {} ({}) SUBMETIDA ao TWS. Retornando DTO com ID IBKR: {}",
                     resultDto.clientOrderId(), resultDto.symbol(), resultDto.orderId());
 
             // Retorna o DTO completo e imutável.
             return resultDto;
 
         } catch (Exception e) {
-            log.error("❌ [Ponte | API-IBKR] Falha ao enviar Ordem Simples para {}. Detalhes: {}", orderDto.symbol(), e.getMessage(), e);
+            // try-catch para rastrear o que acontece no código
+            log.error("❌ [Ponte | API-IBKR] Falha ao enviar Ordem Simples para {}. ID IBKR: {}. Detalhes: {}",
+                    orderDto.symbol(), ibkrOrderId, e.getMessage(), e);
             throw new RuntimeException("Erro ao enviar Ordem Simples para a IBKR: " + e.getMessage(), e);
         }
     }

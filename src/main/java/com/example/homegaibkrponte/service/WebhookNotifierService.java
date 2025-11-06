@@ -1,125 +1,148 @@
 package com.example.homegaibkrponte.service;
 
-import com.example.homegaibkrponte.dto.ExecutionReportDTO;
+import com.example.homegaibkrponte.dto.ExecutionReportDto;
 import com.example.homegaibkrponte.dto.MarketTickDTO;
-import com.example.homegaibkrponte.dto.OrderRejectionDTO;
+import com.example.homegaibkrponte.dto.OrderRejectionDto;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
 
 import java.math.BigDecimal;
 import java.time.Duration;
 
+/**
+ * SERVIÇO NA PONTE IBKR (BRIDGE)
+ * Responsável por notificar a Aplicação Principal (Main) sobre eventos críticos (execução, rejeição, tick) via Webhooks.
+ *
+ * Utiliza WebClient para comunicação reativa e robusta, com política de retries definida.
+ */
 @Service
 @Slf4j
 public class WebhookNotifierService {
 
     private final WebClient webClient;
-    private final String executionWebhookUri; // URI para envio de execução
-    private final String rejectionWebhookUri; // URI para envio de rejeição
 
-    // URL base da aplicação principal (homega.app.url)
-    private static final String BASE_URL_DEFAULT = "http://localhost:8080/api/v1/callbacks/ibkr";
+    // 🚨 AJUSTE CRÍTICO DE SINERGIA: UNIFICANDO OS URIS PARA O WEBHOOK DINÂMICO NO PRINCIPAL
+    // O Principal (WebhookController) só escuta em /webhook/execution-status
+    private static final String EXECUTION_STATUS_URI = "/webhook/execution-status";
+
+    // O Market Tick é um evento separado e precisa ser tratado em um endpoint dedicado
+    private static final String MARKET_TICK_URI = "/api/v1/callbacks/ibkr/market-tick"; // Mantido, assumindo que há um Controller separado para ticks
+
+    // Política de Retentativa: 3 tentativas, com backoff exponencial a partir de 2 segundos.
+    private final Retry retrySpec = Retry.backoff(3, Duration.ofSeconds(2))
+            .doBeforeRetry(retrySignal -> log.warn(
+                    "⚠️ [WEBHOOK-OUT] Falha de comunicação com Principal. Tentativa #{} de 3. Causa: {}",
+                    retrySignal.totalRetries() + 1,
+                    retrySignal.failure().getMessage()
+            ))
+            .onRetryExhaustedThrow((retryBackoffSpec, retrySignal) -> {
+                log.error("❌ [WEBHOOK-OUT - ERRO CRÍTICO] Retries esgotados para o Webhook. Causa final: {}", retrySignal.failure().getMessage());
+                // Lançar exceção para ser capturada e logada no método chamador
+                return new IllegalStateException(
+                        "Falha definitiva no envio do Webhook após 3 retries.",
+                        retrySignal.failure()
+                );
+            });
 
     public WebhookNotifierService(
-            // A melhor prática é injetar a URL base e não o endpoint completo
             @Value("${homega.app.webhook.base-url:http://localhost:8080}") String baseUrl
     ) {
         this.webClient = WebClient.builder()
                 .baseUrl(baseUrl)
                 .build();
-
-        // URLs específicas (Paths)
-        this.executionWebhookUri = "/api/v1/callbacks/ibkr/execution-report";
-        this.rejectionWebhookUri = "/api/v1/callbacks/ibkr/order-rejection"; // Endpoint a ser criado no Principal
-
-        log.info("Webhook Notifier configurado. Base URL: {}", baseUrl);
+        log.info("🔔 [PONTE] WebhookNotifierService configurado. URL Base do Principal: {}", baseUrl);
     }
 
-    public void sendExecutionReport(ExecutionReportDTO report) {
-        log.warn("▶️  [WEBHOOK-OUT] Enviando notificação de execução para a aplicação principal. Ordem: {}", report.orderId());
+    /**
+     * Envia a notificação de Relatório de Execução para a Aplicação Principal.
+     * @param report DTO com os detalhes da execução.
+     */
+    public void sendExecutionReport(ExecutionReportDto report) {
+        log.info("▶️ [WEBHOOK-OUT] Enviando notificação de execução para o Principal. Ordem: {} -> URL: {}", report.getOrderId(), EXECUTION_STATUS_URI);
 
-        webClient.post()
-                .uri(this.executionWebhookUri) // Uso da URI específica
+        this.webClient.post()
+                .uri(EXECUTION_STATUS_URI) // ✅ AJUSTE AQUI
                 .bodyValue(report)
                 .retrieve()
-                .toBodilessEntity()
-                .retryWhen(Retry.backoff(3, Duration.ofSeconds(2))
-                        .doBeforeRetry(retrySignal -> log.warn(
-                                "Falha ao enviar webhook para ordem {}. Tentando novamente... (Tentativa {} de 3)",
-                                report.orderId(),
-                                retrySignal.totalRetries() + 1
-                        ))
-                        .onRetryExhaustedThrow((retryBackoffSpec, retrySignal) -> new IllegalStateException(
-                                "Retries exhausted: " + retrySignal.totalRetries() + "/" + 3,
-                                retrySignal.failure()
-                        ))
+                .onStatus(HttpStatusCode::isError, clientResponse ->
+                        Mono.error(new RuntimeException("Principal retornou erro HTTP: " + clientResponse.statusCode()))
                 )
+                .toBodilessEntity()
+                .retryWhen(retrySpec)
                 .subscribe(
                         response -> log.info(
-                                "✅ [WEBHOOK-OUT] Notificação para ordem {} confirmada pela aplicação principal (Status: {}).",
-                                report.orderId(),
+                                "✅ [WEBHOOK-OUT] Notificação de Execução da ordem {} confirmada pelo Principal (Status: {}).",
+                                report.getOrderId(),
                                 response.getStatusCode()
                         ),
+                        // Captura a exceção se os retries falharem definitivamente
                         error -> log.error(
-                                "❌ Falha definitiva ao enviar notificação de webhook para a ordem {}: {}",
-                                report.orderId(),
+                                "❌ [WEBHOOK-OUT - FALHA PERMANENTE] Falha definitiva ao notificar Execução da ordem {}. Liquidez comprometida até ajuste manual. Causa: {}",
+                                report.getOrderId(),
                                 error.getMessage()
                         )
                 );
     }
 
     /**
-     * 🚨 NOVO MÉTODO CRÍTICO DE SINERGIA: Envia a rejeição da ordem pela corretora ao Principal.
-     * @param brokerOrderId O ID da corretora associado à ordem rejeitada.
+     * Envia a rejeição da ordem pela corretora ao Principal.
+     * @param orderId O ID da Ordem na Aplicação Principal (Client ID na Ponte).
      * @param errorCode O código de erro da corretora (ex: 201).
      * @param reason A mensagem de rejeição.
      */
-    public void sendOrderRejection(int brokerOrderId, int errorCode, String reason) {
-        // 1. Criamos um DTO para encapsular os dados de rejeição.
-        // Crie esta classe/record em com.example.homegaibkrponte.dto
-        OrderRejectionDTO rejection = new OrderRejectionDTO(brokerOrderId, errorCode, reason);
+    public void sendOrderRejection(long orderId, int errorCode, String reason) {
+        OrderRejectionDto rejection = new OrderRejectionDto(orderId, errorCode, reason);
 
-        log.error("🚨 [WEBHOOK-OUT] Enviando REJEIÇÃO CRÍTICA (ID: {}) para a aplicação principal. Cód: {}.", brokerOrderId, errorCode);
+        log.error("🚨 [WEBHOOK-OUT] Enviando REJEIÇÃO CRÍTICA (ID: {}) para o Principal. Cód: {} -> URL: {}",
+                orderId, errorCode, EXECUTION_STATUS_URI);
 
-        webClient.post()
-                .uri(this.rejectionWebhookUri) // Uso da URI específica
+        this.webClient.post()
+                .uri(EXECUTION_STATUS_URI) // ✅ AJUSTE AQUI
                 .bodyValue(rejection)
                 .retrieve()
+                .onStatus(HttpStatusCode::isError, clientResponse ->
+                        Mono.error(new RuntimeException("Principal retornou erro HTTP: " + clientResponse.statusCode()))
+                )
                 .toBodilessEntity()
+                .retryWhen(retrySpec)
                 .subscribe(
                         response -> log.info(
-                                "✅ [WEBHOOK-OUT] Notificação de REJEIÇÃO (ID: {}) confirmada (Status: {}).",
-                                brokerOrderId,
+                                "✅ [WEBHOOK-OUT] Notificação de REJEIÇÃO (ID: {}) confirmada pelo Principal (Status: {}).",
+                                orderId,
                                 response.getStatusCode()
                         ),
                         error -> log.error(
-                                "❌ Falha ao enviar notificação de REJEIÇÃO para a ordem {}: {}",
-                                brokerOrderId,
+                                "❌ [WEBHOOK-OUT - FALHA PERMANENTE] Falha definitiva ao notificar REJEIÇÃO da ordem {}. Capital pode permanecer comprometido. Causa: {}",
+                                orderId,
                                 error.getMessage()
                         )
                 );
     }
 
     /**
-     * 🚨 NOVO MÉTODO CRÍTICO: Envia o tick de preço da Ponte para o Principal.
-     * @param symbol Símbolo do ativo.
-     * @param price Preço em tempo real.
+     * Envia o tick de preço da Ponte para o Principal.
      */
     public void sendMarketTick(String symbol, BigDecimal price) {
         MarketTickDTO tick = new MarketTickDTO(symbol, price);
-        log.debug("▶️  [WEBHOOK-OUT] Enviando Market Tick para {} (R${}) para o Principal.", symbol, price);
+        log.trace("▶️ [WEBHOOK-OUT] Enviando Market Tick para {} (R${}) para o Principal.", symbol, price);
 
-        webClient.post()
-                .uri("/api/v1/callbacks/ibkr/market-tick") // Endpoint que o Principal precisa implementar
+        this.webClient.post()
+                .uri(MARKET_TICK_URI)
                 .bodyValue(tick)
                 .retrieve()
+                .onStatus(HttpStatusCode::isError, clientResponse ->
+                        Mono.error(new RuntimeException("Principal retornou erro HTTP: " + clientResponse.statusCode()))
+                )
                 .toBodilessEntity()
+                .retryWhen(Retry.backoff(2, Duration.ofMillis(500)))
                 .subscribe(
                         response -> log.trace("✅ [WEBHOOK-OUT] Market Tick para {} confirmado (Status: {}).", symbol, response.getStatusCode()),
-                        error -> log.error("❌ Falha ao enviar Market Tick para {}: {}", symbol, error.getMessage())
+                        error -> log.warn("❌ Falha temporária ao enviar Market Tick para {}: {}", symbol, error.getMessage())
                 );
     }
 }

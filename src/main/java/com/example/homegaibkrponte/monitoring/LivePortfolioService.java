@@ -27,6 +27,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+/**
+ * 🌉 **PONTE (BRIDGE):** Responsável por ser o cache local e o sink para os dados brutos da conta IBKR.
+ * [CORRIGIDO]: Assinaturas de métodos de execução ajustadas para o TradeExecutedEvent, resolvendo os erros de compilação.
+ */
 @Service
 @Slf4j
 @Getter
@@ -35,26 +39,23 @@ public class LivePortfolioService {
     private final AtomicReference<Portfolio> portfolioState = new AtomicReference<>();
     private final ApplicationEventPublisher eventPublisher;
 
-    /**
-     * ✅ NOVO: Record para armazenar o valor e o timestamp (Java 21)
-     */
     public record AccountBalance(BigDecimal value, LocalDateTime timestamp) {}
 
-    // 🚨 CORREÇÃO 1: Cache para fallback do Buying Power, agora com timestamp para frescor.
     private final AtomicReference<AccountBalance> lastAccountBalance =
             new AtomicReference<>(new AccountBalance(BigDecimal.ZERO, LocalDateTime.MIN));
 
-    // 🚨 CORREÇÃO 2: Latch mutável para sincronização de Saldo em tempo real.
     private final AtomicReference<CountDownLatch> accountSyncLatch =
             new AtomicReference<>(new CountDownLatch(1));
 
     private final AtomicBoolean isSynced = new AtomicBoolean(false);
 
-    // Latch para gerenciar a espera pela sincronização de posições.
     private volatile CountDownLatch positionSyncLatch = new CountDownLatch(1);
 
     @Value("${trading.initial-capital:200000.0}")
     private double initialCapital;
+
+    // Cache para todos os valores de conta (Incluindo EL e NLV)
+    private final ConcurrentHashMap<String, BigDecimal> accountValuesCache = new ConcurrentHashMap<>();
 
     public LivePortfolioService(ApplicationEventPublisher eventPublisher) {
         this.eventPublisher = eventPublisher;
@@ -62,7 +63,6 @@ public class LivePortfolioService {
 
     @PostConstruct
     public void init() {
-        // Inicializa o cache com o capital inicial e o timestamp atual (para o primeiro fallback).
         lastAccountBalance.set(new AccountBalance(BigDecimal.valueOf(initialCapital), LocalDateTime.now()));
 
         Portfolio initialPortfolio = new Portfolio(
@@ -77,36 +77,32 @@ public class LivePortfolioService {
 
     // --- MÉTODOS DE SINCRONIZAÇÃO DE SALDO ---
 
-    /**
-     * 🚪 Reinicia o sinalizador de sincronização de saldo para permitir uma nova espera.
-     */
     public void resetAccountSyncLatch() {
-        // Usa getAndUpdate para garantir thread-safety ao verificar e substituir a latch
         accountSyncLatch.getAndUpdate(currentLatch -> {
             if (currentLatch.getCount() == 0) {
                 log.debug("🔄 Sinalizador de sincronização de saldo resetado.");
                 return new CountDownLatch(1);
             }
-            return currentLatch; // Retorna a latch atual se não precisar de reset
+            return currentLatch;
         });
     }
 
     public boolean awaitInitialSync(long timeoutMillis) throws InterruptedException {
-        // Obtém a latch atual e espera por ela
         CountDownLatch latch = accountSyncLatch.get();
         log.info("Aguardando a sincronização de saldo da corretora (timeout de {}ms)...", timeoutMillis);
         return latch.await(timeoutMillis, TimeUnit.MILLISECONDS);
     }
 
     /**
-     * Recebe o valor de saldo já convertido (BigDecimal) do IBKRConnector.
-     * REMOVIDO @Override, pois esta classe não implementa EWrapper.
+     * 🌉 SINK: Recebe valores brutos da conta IBKR (BuyingPower, ExcessLiquidity, etc.).
      */
     public void updateAccountValue(String key, BigDecimal value) {
+        // Armazenamento genérico no cache da Ponte
+        accountValuesCache.put(key, value);
+
         if ("BuyingPower".equalsIgnoreCase(key)) {
             LocalDateTime now = LocalDateTime.now();
 
-            // 🚨 1. Atualiza o cache e o estado do Portfolio com o novo valor e o timestamp
             lastAccountBalance.set(new AccountBalance(value, now));
 
             portfolioState.getAndUpdate(current -> current.toBuilder()
@@ -114,9 +110,8 @@ public class LivePortfolioService {
                     .build()
             );
 
-            // 🚨 2. Libera a Latch
             CountDownLatch latch = accountSyncLatch.get();
-            latch.countDown(); // Libera a latch para requisições subsequentes e a inicial
+            latch.countDown();
 
             if (isSynced.compareAndSet(false, true)) {
                 log.warn("✅ PRIMEIRA SINCRONIZAÇÃO DE SALDO COMPLETA! Poder de Compra: R$ {}. Sistema operacional.", value);
@@ -124,9 +119,14 @@ public class LivePortfolioService {
                 log.info("Sincronização de saldo contínua. Poder de Compra atualizado: R$ {}", value.toPlainString());
             }
         }
+
+        // Log para rastrear os valores de margem CRÍTICOS
+        if ("ExcessLiquidity".equalsIgnoreCase(key) || "NetLiquidationValue".equalsIgnoreCase(key)) {
+            log.debug("📊 [CACHE PONTE] Margem Bruta Sincronizada: {} = R$ {}", key, value.toPlainString());
+        }
     }
 
-    // --- MÉTODOS DE SINCRONIZAÇÃO DE POSIÇÕES (MANTIDOS) ---
+    // --- MÉTODOS DE SINCRONIZAÇÃO DE POSIÇÕES ---
 
     public void resetPositionSyncLatch() {
         this.positionSyncLatch = new CountDownLatch(1);
@@ -159,77 +159,76 @@ public class LivePortfolioService {
         positionSyncLatch.countDown();
     }
 
-    // --- MÉTODOS DE ACESSO ---
+    // --- MÉTODOS DE ACESSO CRÍTICOS PARA O PRINCIPAL ---
 
     public Portfolio getLivePortfolioSnapshot() {
         return portfolioState.get();
     }
 
-    public boolean isSynced() {
-        return isSynced.get();
+    /**
+     * Retorna o valor bruto do Excess Liquidity do cache local.
+     */
+    public BigDecimal getExcessLiquidity() {
+        return accountValuesCache.getOrDefault("ExcessLiquidity", BigDecimal.ZERO);
     }
 
     /**
-     * 🚨 AJUSTE 3: Retorna o valor do cache (usado no Controller como fallback)
+     * Retorna o valor bruto do Buying Power do cache local.
      */
     public BigDecimal getCurrentBuyingPower() {
         return lastAccountBalance.get().value();
     }
 
     /**
-     * ✅ NOVO: Retorna o snapshot completo (valor + timestamp).
-     * Usado pelo Controller para verificar a validade/frescor do cache.
+     * Busca uma posição aberta no snapshot.
      */
+    public Optional<Position> getPosition(String symbol) {
+        Map<String, Position> openPositions = getLivePortfolioSnapshot().openPositions();
+        return Optional.ofNullable(openPositions.get(symbol));
+    }
+
+    /**
+     * Atualiza uma posição específica no snapshot do portfólio.
+     */
+    public void updatePosition(Position updatedPosition) {
+        if (updatedPosition == null || updatedPosition.getSymbol() == null) return;
+
+        portfolioState.getAndUpdate(currentPortfolio -> {
+            Map<String, Position> newPositions = new ConcurrentHashMap<>(currentPortfolio.openPositions());
+            newPositions.put(updatedPosition.getSymbol(), updatedPosition);
+
+            log.warn("🔄 [LIVE PORTFOLIO] Posição {} atualizada na memória (SL/TP ou Média).", updatedPosition.getSymbol());
+
+            return currentPortfolio.toBuilder()
+                    .openPositions(newPositions)
+                    .build();
+        });
+    }
+
+    public boolean isSynced() {
+        return isSynced.get();
+    }
+
     public AccountBalance getLastBuyingPowerSnapshot() {
         return lastAccountBalance.get();
     }
 
-    // --- LÓGICA DE EXECUÇÃO DE TRADE (MANTIDA) ---
 
-    @EventListener
-    public void onTradeExecuted(TradeExecutedEvent event) {
-        try {
-            log.info("🎧 Evento de trade recebido: Fonte [{}], Ativo [{}], Lado [{}]", event.executionSource(), event.symbol(), event.side());
-
-            portfolioState.getAndUpdate(currentPortfolio -> {
-                String side = event.side().toUpperCase();
-
-                // 1. Identifica a posição existente
-                Position existingPosition = currentPortfolio.openPositions().get(event.symbol());
-
-                // 2. Lógica de Roteamento Baseada no Lado do Evento
-                if (side.contains("BUY") || side.contains("BOT")) {
-                    if (existingPosition != null && existingPosition.getDirection() == PositionDirection.SHORT) {
-                        return performShortCoverExecution(currentPortfolio, event.symbol(), event.quantity(), event.price());
-                    } else {
-                        return performBuyExecution(currentPortfolio, event.symbol(), event.quantity(), event.price());
-                    }
-                } else if (side.contains("SELL") || side.contains("SLD")) {
-                    if (existingPosition != null && existingPosition.getDirection() == PositionDirection.LONG) {
-                        return performSellExecution(currentPortfolio, event.symbol(), event.quantity(), event.price());
-                    } else {
-                        return performShortEntryExecution(currentPortfolio, event.symbol(), event.quantity(), event.price());
-                    }
-                }
-
-                log.error("❌ [ROTEAMENTO ERRO] Lado de execução desconhecido/não tratado: {}", side);
-                return currentPortfolio; // Retorna o estado atual no lambda em caso de erro
-            });
-        } catch (Exception e) {
-            log.error("❌ ERRO CRÍTICO ao processar TradeExecutedEvent para {}. Causa: {}.", event.symbol(), e.getMessage(), e);
-        }
-    }
-
-    // --- MÉTODOS PRIVADOS DE DOMÍNIO (MANTIDOS) ---
+    // --- MÉTODOS PRIVADOS DE DOMÍNIO (CORRIGIDOS) ---
 
     private Position mapPositionDTOtoDomain(PositionDTO dto) {
         BigDecimal quantity = dto.getPosition().abs();
         PositionDirection direction = dto.getPosition().signum() > 0 ? PositionDirection.LONG : PositionDirection.SHORT;
-        // O campo mktPrice do DTO contém o averageCost vindo da API da IBKR
         return new Position(dto.getTicker(), quantity, dto.getMktPrice(), LocalDateTime.now(), direction, null, null, "Sincronizado via TWS");
     }
 
-    private Portfolio performShortEntryExecution(Portfolio current, String symbol, BigDecimal qty, BigDecimal price) {
+    // 🚨 AJUSTE DE ASSINATURA: Métodos perform* agora aceitam apenas TradeExecutedEvent
+
+    private Portfolio performShortEntryExecution(Portfolio current, TradeExecutedEvent event) {
+        String symbol = event.symbol();
+        BigDecimal qty = event.quantity();
+        BigDecimal price = event.price();
+
         BigDecimal cost = qty.multiply(price);
         BigDecimal newCash = current.cashBalance().add(cost);
         Map<String, Position> newPositions = new ConcurrentHashMap<>(current.openPositions());
@@ -241,7 +240,11 @@ public class LivePortfolioService {
         return new Portfolio(current.symbolForBacktest(), newCash, newPositions, current.tradeHistory());
     }
 
-    private Portfolio performShortCoverExecution(Portfolio current, String symbol, BigDecimal qty, BigDecimal price) {
+    private Portfolio performShortCoverExecution(Portfolio current, TradeExecutedEvent event) {
+        String symbol = event.symbol();
+        BigDecimal qty = event.quantity();
+        BigDecimal price = event.price();
+
         Position positionToClose = current.openPositions().get(symbol);
 
         BigDecimal cost = qty.multiply(price);
@@ -276,7 +279,11 @@ public class LivePortfolioService {
         return new Portfolio(current.symbolForBacktest(), newCash, newPositions, current.tradeHistory());
     }
 
-    private Portfolio performBuyExecution(Portfolio current, String symbol, BigDecimal qty, BigDecimal price) {
+    private Portfolio performBuyExecution(Portfolio current, TradeExecutedEvent event) {
+        String symbol = event.symbol();
+        BigDecimal qty = event.quantity();
+        BigDecimal price = event.price();
+
         BigDecimal cost = qty.multiply(price);
         BigDecimal newCash = current.cashBalance().subtract(cost);
         Map<String, Position> newPositions = new ConcurrentHashMap<>(current.openPositions());
@@ -286,9 +293,12 @@ public class LivePortfolioService {
             BigDecimal totalQty = existingPosition.getQuantity().add(qty);
             BigDecimal totalCost = existingPosition.getAverageEntryPrice().multiply(existingPosition.getQuantity()).add(cost);
             BigDecimal newAvgPrice = totalCost.divide(totalQty, 4, RoundingMode.HALF_UP);
-            Position updatedPosition = new Position(symbol, totalQty, newAvgPrice, LocalDateTime.now(), existingPosition.getDirection(), null, null, "Aumento de Posição");
+
+            // Mantendo SL/TP existente para aumento de posição
+            Position updatedPosition = new Position(symbol, totalQty, newAvgPrice, LocalDateTime.now(), existingPosition.getDirection(), existingPosition.getStopLoss(), existingPosition.getTakeProfit(), "Aumento de Posição");
             newPositions.put(symbol, updatedPosition);
         } else {
+            // NOTA: Nova posição sem SL/TP; será anexado no updatePosition
             Position newPosition = new Position(symbol, qty, price, LocalDateTime.now(), PositionDirection.LONG, null, null, "Nova Posição");
             newPositions.put(symbol, newPosition);
         }
@@ -297,7 +307,11 @@ public class LivePortfolioService {
         return new Portfolio(current.symbolForBacktest(), newCash, newPositions, current.tradeHistory());
     }
 
-    private Portfolio performSellExecution(Portfolio current, String symbol, BigDecimal qty, BigDecimal price) {
+    private Portfolio performSellExecution(Portfolio current, TradeExecutedEvent event) {
+        String symbol = event.symbol();
+        BigDecimal qty = event.quantity();
+        BigDecimal price = event.price();
+
         Position positionToClose = current.openPositions().get(symbol);
 
         if (positionToClose == null) {
@@ -333,5 +347,29 @@ public class LivePortfolioService {
         }
 
         return new Portfolio(current.symbolForBacktest(), newCash, newPositions, current.tradeHistory());
+    }
+
+    // --- PROCESSAMENTO DE EVENTOS INTERNOS (EVENT LISTENER) ---
+
+    @EventListener
+    public void onTradeExecuted(TradeExecutedEvent event) {
+        log.info("🎧 Evento de trade recebido: Fonte [{}], Símbolo [{}], Lado [{}], Qtd [{}], Preço [R$ {}]",
+                event.executionSource(), event.symbol(), event.side(), event.quantity(), event.price());
+
+        // A Ponte não deve ter lógica de mirrorPaperTrades, mas a lógica de execução deve ser mantida.
+
+        // Lógica de atualização de portfólio atômica (Princípio da Imutabilidade)
+        portfolioState.getAndUpdate(currentPortfolio -> {
+            try {
+                if (event.side().equalsIgnoreCase("BUY") || event.side().equalsIgnoreCase("BOT")) {
+                    return performBuyExecution(currentPortfolio, event);
+                } else { // SELL or SLD or BUY_TO_COVER
+                    return performSellExecution(currentPortfolio, event);
+                }
+            } catch (Exception e) {
+                log.error("❌ ERRO CRÍTICO ao processar evento de trade para {}. Estado do portfólio NÃO ALTERADO.", event.symbol(), e);
+                return currentPortfolio;
+            }
+        });
     }
 }

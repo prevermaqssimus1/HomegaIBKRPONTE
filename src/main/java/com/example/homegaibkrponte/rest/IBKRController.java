@@ -32,6 +32,8 @@ public class IBKRController {
     private final OrderService orderService;
     private final LivePortfolioService portfolioService;
     private final OrderIdManager orderIdManager;
+    // ✅ OBSERVAÇÃO: A dependência 'accountService' foi removida,
+    // e o requestAccountSummarySnapshot será feito via 'connector'.
 
     @GetMapping("/status")
     public ResponseEntity<String> getStatus() {
@@ -44,15 +46,37 @@ public class IBKRController {
     }
 
     /**
-     * ✅ CORRIGIDO: Este método agora busca o poder de compra em tempo real a cada requisição.
-     * A lógica de cache foi removida para garantir que o valor retornado seja sempre o mais atual.
+     * 🚨 NOVO ENDPOINT (SINERGIA): Força a sincronização completa dos valores de conta (BP, EL, NLV) do TWS.
+     * Necessário para resolver o problema de dados de margem desatualizados no Principal.
      */
-    // MÉTODO PRONTO PARA SUBSTITUIR: IBKRController.getBuyingPower()
+    @GetMapping("/sync-account-values")
+    public ResponseEntity<Void> syncAccountValues(@RequestParam String accountId) {
+        if (!connector.isConnected()) {
+            log.error("❌ [Ponte | SYNC] Conexão com TWS inativa. Não é possível sincronizar valores de conta.");
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        }
 
-    // MÉTODO PRONTO PARA SUBSTITUIR: IBKRController.getBuyingPower()
+        log.info("➡️ [Ponte | SYNC] Recebida requisição do Principal para sincronização forçada de valores de conta para {}", accountId);
 
-    // MÉTODO PRONTO PARA SUBSTITUIR: IBKRController.getBuyingPower()
+        try {
+            // Dispara a subscrição de atualização de conta no TWS (que é assíncrona)
+            // Usamos reqAccountUpdates que dispara o callback updateAccountValue
+            connector.getClient().reqAccountUpdates(true, accountId);
+            log.warn("🔄 [Ponte | SYNC] Subscrição de Account Updates enviada ao TWS. Dados serão atualizados via callback.");
 
+            // Retornamos OK imediatamente, pois a atualização é assíncrona.
+            return ResponseEntity.ok().build();
+
+        } catch (Exception e) {
+            log.error("❌ [Ponte | SYNC] Falha ao iniciar a sincronização de valores de conta no TWS.", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+
+    /**
+     * ✅ CORRIGIDO: Este método agora busca o poder de compra em tempo real a cada requisição.
+     */
     @GetMapping("/buying-power")
     public ResponseEntity<BigDecimal> getBuyingPower() {
         log.info("------------------------------------------------------------");
@@ -79,15 +103,10 @@ public class IBKRController {
 
             if (!syncCompleted) {
                 // AJUSTE CRÍTICO: TIMEOUT. Usar o valor MAIS FRESCO disponível.
-
-                // Re-captura o valor, caso tenha chegado no TWS no último milissegundo do timeout.
                 BigDecimal finalBuyingPower = portfolioService.getCurrentBuyingPower();
-
-                // Se o valor FINAL ainda for ZERO (e deu timeout), ativa a emergência.
                 BigDecimal fallbackValue = (finalBuyingPower.compareTo(BigDecimal.ZERO) == 0 && cachedBuyingPower.compareTo(BigDecimal.ZERO) == 0)
                         ? BigDecimal.ZERO : finalBuyingPower;
 
-                // ✅ MELHORIA DE LOG: Indica que o fallback foi usado
                 log.error("❌ TIMEOUT (15s)! Sincronização falhou. Retornando valor de FALLBACK (R${}).", fallbackValue);
                 return ResponseEntity.ok(fallbackValue);
             }
@@ -105,8 +124,6 @@ public class IBKRController {
             log.info("------------------------------------------------------------");
         }
     }
-// MANTENHA TODOS OS OUTROS MÉTODOS DO IBKRController IGUAIS (getPositions, placeOrder, etc.)
-// A CLASSE COMPLETA NÃO FOI REPETIDA AQUI PARA MANTER A CLAREZA, MAS VOCÊ DEVE SUBSTITUIR APENAS ESTE MÉTODO.
 
     @GetMapping("/positions")
     public ResponseEntity<List<PositionDTO>> getOpenPositions() {
@@ -119,14 +136,12 @@ public class IBKRController {
         }
 
         try {
-            // Reinicia o "sinalizador" para garantir que vamos esperar pela NOVA resposta
             portfolioService.resetPositionSyncLatch();
 
             log.info("➡️  Solicitando posições à corretora e aguardando resposta...");
             connector.getClient().reqPositions();
 
-            // Pausa a execução aqui e espera o LivePortfolioService avisar que terminou
-            boolean syncCompleted = portfolioService.awaitPositionSync(60000); // Timeout de 60s
+            boolean syncCompleted = portfolioService.awaitPositionSync(60000);
 
             if (!syncCompleted) {
                 log.error("❌ TIMEOUT! A sincronização de posições não ocorreu em 60 segundos.");
@@ -138,7 +153,7 @@ public class IBKRController {
                     .openPositions()
                     .values()
                     .stream()
-                    .map(this::mapPositionToDTO) // Usa o método auxiliar para conversão
+                    .map(this::mapPositionToDTO)
                     .collect(Collectors.toList());
 
             log.info("⬅️  Retornando {} posições abertas via API REST.", openPositions.size());
@@ -150,6 +165,27 @@ public class IBKRController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Collections.emptyList());
         } finally {
             log.info("------------------------------------------------------------");
+        }
+    }
+
+    /**
+     * ✅ CORREÇÃO FINAL DE SINERGIA: Endpoint chamado pelo Principal para forçar o Snapshot de Conta (EL/BP).
+     * Resolve o problema do Resgate e a discrepância de Liquidez.
+     */
+    @PostMapping("/sync-snapshot")
+    public ResponseEntity<Void> triggerAccountSummarySnapshot() {
+        // Aplica try-catch e logs explicativos (Obrigatório)
+        try {
+            log.info("🔄 [Ponte | SYNC COMANDO] Recebido comando do Principal para forçar o Account Summary Snapshot.");
+
+            // ✅ CORREÇÃO: Chama o método existente no IBKRConnector
+            connector.requestAccountSummarySnapshot();
+
+            log.info("✅ [Ponte | SYNC] Snapshot de Account Summary disparado no TWS. Dados serão atualizados assincronamente.");
+            return ResponseEntity.accepted().build();
+        } catch (Exception e) {
+            log.error("❌ [Ponte | ERRO SYNC] Falha ao disparar o Account Summary Snapshot. Rastreando.", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
 
@@ -188,7 +224,6 @@ public class IBKRController {
 
         } catch (Exception e) {
             // LOG para erros críticos (Ex: falha de comunicação, erro de infraestrutura)
-            // É crucial usar o log.error com a exceção (e) para que o stack trace seja registrado.
             log.error("💥 [Ponte | Controller] Erro CRÍTICO ao processar ordem. ClientID: {}. Mensagem: {}",
                     orderDto.clientOrderId(), e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null);
@@ -209,7 +244,4 @@ public class IBKRController {
 
     // Classe interna para a resposta do ID da ordem
     private record NextOrderIdResponse(int nextOrderId) {}
-
-
-
 }

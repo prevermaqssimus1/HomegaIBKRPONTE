@@ -34,6 +34,7 @@ public enum OrderType {
     SELL_STOP_LOSS(PositionSide.SELL),
     SELL_TAKE_PROFIT(PositionSide.SELL);
 
+
     private final PositionSide side;
 
     OrderType(PositionSide side) {

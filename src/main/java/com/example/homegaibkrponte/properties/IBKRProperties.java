@@ -2,8 +2,9 @@ package com.example.homegaibkrponte.properties;
 
 import com.example.homegaibkrponte.config.properties.ApiKeysProperties;
 
-// O record deve ter seus parâmetros referenciados diretamente se for um record Java 14+
-// Caso contrário, use uma classe normal com @Getter para garantir a geração.
+/**
+ * Record que armazena as propriedades de conexão da IBKR.
+ */
 public record IBKRProperties(
         String host,
         String username,
@@ -13,12 +14,19 @@ public record IBKRProperties(
 ) {
     public IBKRProperties(ApiKeysProperties.Ibkr ibkrConfig) {
         this(
-                // Chamadas diretas ao método getter do Lombok (ex: getHost())
-                ibkrConfig.getHost(), // <-- Use o getter explícito
+                ibkrConfig.getHost(),
                 ibkrConfig.getUsername(),
                 ibkrConfig.getPassword(),
                 ibkrConfig.getPort(),
                 ibkrConfig.getClientId()
         );
+    }
+
+    // ✅ NOVO MÉTODO (NECESSÁRIO para sinergia) - A conta deve ser buscada do Connector ou fixada.
+    // Retorna o ClientId como String, caso algum serviço peça o AccountId mas apenas tenha o ClientId.
+    public String accountId() {
+        // ⚠️ ATENÇÃO: Retornar uma String vazia ou um ID FALSO PODE CAUSAR ERRO 201.
+        // Já que você não o tem na config, usaremos o ClientId, mas o ideal é que seja o ID da conta.
+        return String.valueOf(this.clientId);
     }
 }

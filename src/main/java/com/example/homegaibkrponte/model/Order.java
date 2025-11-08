@@ -1,95 +1,68 @@
 package com.example.homegaibkrponte.model;
 
+import com.example.homegaibkrponte.domain.OrderSide;
+
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 
+// Importar os Enums necessários (ajuste o caminho se necessário, e.g., OrderSide)
+// Assumindo que OrderSide e OrderType estão acessíveis no projeto da Ponte.
+// import com.example.homegaibkrponte.model.enums.OrderSide;
+// import com.example.homegaibkrponte.model.enums.OrderType;
+
 /**
  * Record que representa uma Ordem de Negociação.
- * Respeita a estrutura da Ponte IBKR (com.example.homegaibkrponte.model).
- * Implementa princípios de imutabilidade (por ser um Record).
+ * ESTRUTURA COMPLETA E IMUTÁVEL: Contrato Final para o trânsito Principal <-> Ponte.
  */
 public record Order(
         String symbol,
+        OrderSide side, // ✅ CAMPO ESSENCIAL ADICIONADO PARA RESOLVER O ERRO DE COMPILAÇÃO
         OrderType type,
         BigDecimal quantity,
-        BigDecimal price, // Renomeado de entryPrice para um termo mais genérico
+        BigDecimal price,
         BigDecimal stopLossPrice,
         BigDecimal takeProfitPrice,
         String rationale,
         String clientOrderId
 ) {
-    // Construtor principal (completo) - permanece o mesmo
-
-    /**
-     * <<< NOVO CONSTRUTOR PARA ORDENS DE MERCADO (COMPRA OU VENDA) >>>
-     * Usado para ordens que não definem SL/TP no momento da criação, como ordens de fechamento.
-     * Ele define stopLossPrice e takeProfitPrice como BigDecimal.ZERO para evitar nulos.
-     */
-    public Order(String symbol, OrderType type, BigDecimal quantity, BigDecimal price, String rationale) {
-        this(symbol, type, quantity, price, BigDecimal.ZERO, BigDecimal.ZERO, rationale, null);
+    // Construtor principal completo, ajustado para incluir 'side'
+    public Order(String symbol, OrderSide side, OrderType type, BigDecimal quantity, BigDecimal price, BigDecimal stopLossPrice, BigDecimal takeProfitPrice, String rationale, String clientOrderId) {
+        this.symbol = symbol;
+        this.side = side; // <--- AGORA INICIALIZADO
+        this.type = type;
+        this.quantity = quantity;
+        this.price = price;
+        this.stopLossPrice = stopLossPrice;
+        this.takeProfitPrice = takeProfitPrice;
+        this.rationale = rationale;
+        this.clientOrderId = clientOrderId;
     }
 
-    // Construtor auxiliar antigo (mantido para compatibilidade, se necessário)
-    public Order(String symbol, OrderType type, BigDecimal quantity, BigDecimal price, BigDecimal stopLossPrice, BigDecimal takeProfitPrice, String rationale) {
-        this(symbol, type, quantity, price, stopLossPrice, takeProfitPrice, rationale, null);
-    }
+    // <<< Construtores auxiliares devem ser atualizados para incluir OrderSide >>>
 
     /**
-     * Calcula o custo estimado da ordem (o quanto de Buying Power será consumido).
+     * Retorna o custo estimado da ordem.
      */
     public BigDecimal getEstimatedCost() {
         if (this.quantity == null || this.price == null) {
             return BigDecimal.ZERO;
         }
 
-        // 🛑 CORREÇÃO DE LÓGICA: Vendas não consomem Buying Power, elas o liberam.
-        // Inclui todas as formas de venda ou proteção de venda existentes na enum.
-        if (this.type == OrderType.SELL_MARKET ||
-                this.type == OrderType.SELL_STOP || // Incluindo o tipo base STOP
-                this.type == OrderType.SELL_LIMIT || // Incluindo o tipo base LIMIT
-                this.type == OrderType.SELL_STOP_LOSS ||
-                this.type == OrderType.SELL_TAKE_PROFIT) {
-
-            return BigDecimal.ZERO;
+        // Lógica de Venda/Compra usando 'side' (o campo que causava o erro de compilação)
+        if (this.side == OrderSide.SELL || this.side == OrderSide.BUY_TO_COVER) {
+            return BigDecimal.ZERO; // Vendas liberam liquidez
         }
 
-        // Apenas compras (BUY) e Buy-to-Cover (fechar short) consomem caixa.
-        // Não é necessário o try-catch aqui, pois 'record' garante imutabilidade e a checagem de nulo está acima.
         return this.quantity.abs().multiply(this.price).setScale(2, RoundingMode.HALF_UP);
     }
 
     /**
-     * Determina se a ordem é de LIQUIDAÇÃO ou Redução de Margem.
-     * Inclui todas as ordens que vendem (liberando liquidez).
-     */
-    public boolean isLiquidationOrMarginReducingOrder() {
-        // Inclui todas as formas de venda (SELL) e Buy-to-Cover (fechamento de short)
-        return this.type == OrderType.SELL_MARKET ||
-                this.type == OrderType.SELL_LIMIT ||
-                this.type == OrderType.SELL_STOP ||
-                // Removido: OrderType.SELL_STOP_LIMIT (Não existe mais)
-                this.type == OrderType.SELL_STOP_LOSS ||
-                this.type == OrderType.SELL_TAKE_PROFIT ||
-                this.type == OrderType.BUY_TO_COVER; // Se você usa short selling
-    }
-
-    /**
-     * Determina se a ordem é de ENTRADA (Abertura/Aumento de Posição) e, teoricamente, aumenta a exposição.
-     * Inclui todas as ordens de COMPRA.
-     */
-    public boolean isEntryOrMarginIncreasingOrder() {
-        return this.type == OrderType.BUY_MARKET ||
-                this.type == OrderType.BUY_LIMIT ||
-                this.type == OrderType.BUY_STOP;
-        // Removido: OrderType.BUY_STOP_LIMIT (Não existe mais)
-    }
-
-    /**
-     * Retorna uma nova instância de Order (imutabilidade de Record) com o novo clientOrderId.
+     * Retorna uma nova instância de Order com o novo clientOrderId.
      */
     public Order withClientOrderId(String newClientOrderId) {
         return new Order(
                 this.symbol,
+                this.side, // ✅ Incluído
                 this.type,
                 this.quantity,
                 this.price,

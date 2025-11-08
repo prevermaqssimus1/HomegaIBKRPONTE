@@ -1,4 +1,4 @@
-package com.example.homegaibkrponte.domain.enums;
+package com.example.homegaibkrponte.domain;
 
 /**
  * Define a causa ou o gatilho que originou uma ordem.

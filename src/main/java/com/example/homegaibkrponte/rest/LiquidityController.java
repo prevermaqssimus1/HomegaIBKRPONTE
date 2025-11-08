@@ -1,13 +1,13 @@
 package com.example.homegaibkrponte.rest;
 
 import com.example.homegaibkrponte.connector.IBKRConnector;
+import com.example.homegaibkrponte.model.MarginMetricsDTO;
+import com.example.homegaibkrponte.model.Order;
+import com.example.homegaibkrponte.service.IBKRMarginService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
 
@@ -23,6 +23,7 @@ public class LiquidityController {
 
     // A Ponte contém o cache e a lógica de comunicação com o TWS
     private final IBKRConnector ibkrConnector;
+    private final IBKRMarginService marginService;
 
     /**
      * Retorna o valor atual da Liquidez em Excesso (Excess Liquidity).
@@ -68,4 +69,33 @@ public class LiquidityController {
             return ResponseEntity.status(500).build();
         }
     }
+
+
+
+    @PostMapping("/margin-check/{symbol}")
+    public ResponseEntity<MarginMetricsDTO> getRealTimeMarginMetrics(
+            @PathVariable String symbol,
+            @RequestBody Order whatIfOrder) {
+
+        log.info("➡️ [PONTE | API] Recebida requisição WhatIf para {} (Qtd: {}). Executando simulação de Margem...",
+                symbol, whatIfOrder.quantity());
+
+        try {
+            // Chamada ao serviço interno da Ponte
+            MarginMetricsDTO metrics = marginService.simulateWhatIf(whatIfOrder);
+
+            log.info("✅ [PONTE | DADO ENVIADO] Margem WhatIf: {}", metrics.isMarginSafe());
+            return ResponseEntity.ok(metrics);
+        } catch (Exception e) {
+            // Tratamento de erro na Ponte
+            MarginMetricsDTO failedMetrics = new MarginMetricsDTO();
+            failedMetrics.setMarginSafe(false);
+            return ResponseEntity.internalServerError().body(failedMetrics);
+        }
+    }
+
+
+
+
+
 }

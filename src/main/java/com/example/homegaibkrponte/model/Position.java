@@ -1,6 +1,6 @@
 package com.example.homegaibkrponte.model;
 
-import com.example.homegaibkrponte.domain.enums.OrderSide;
+import com.example.homegaibkrponte.domain.OrderSide;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Builder;
@@ -13,7 +13,9 @@ import java.time.LocalDateTime;
 import java.util.Optional;
 
 /**
- * Modelo de Posição usado na Ponte IBKR.
+ * Modelo de Posição usado na Ponte IBKR. [cite: 360]
+ * Ajuste: O método getClosingOrderType deve retornar o tipo nativo da Ponte (MKT),
+ * pois a Ação é resolvida separadamente por getClosingOrderSide().
  */
 @Getter
 @ToString
@@ -73,22 +75,18 @@ public final class Position {
     // --- MÉTODOS DE DOMÍNIO ESSENCIAIS PARA A PONTE ---
 
     /**
-     * ✅ CORREÇÃO CRÍTICA: Determina o tipo de ordem de mercado para fechar a posição.
-     * Deve retornar o tipo específico da Ponte: SELL_MARKET ou BUY_MARKET.
+     * ✅ AJUSTE DE SINERGIA: Determina o TIPO de ordem de mercado para fechar a posição.
+     * Na Ponte, Market Order (compra ou venda) é sempre OrderType.MKT.
      */
     public OrderType getClosingOrderType() {
-        // Se a posição for LONG, o fechamento é VENDER A MERCADO.
-        if (this.direction == PositionDirection.LONG) {
-            return OrderType.SELL_MARKET;
-        }
-        // Se a posição for SHORT, o fechamento é COMPRAR A MERCADO (Buy to Cover).
-        else {
-            return OrderType.BUY_MARKET;
-        }
+        // Retorna o tipo de ordem de mercado da Ponte, sem a Ação (BUY/SELL)
+        // Isso elimina a necessidade de SELL_MARKET ou BUY_MARKET na Ponte.
+        return OrderType.MKT;
     }
 
     /**
-     * Determina o lado da ordem para fechar a posição (RESOLVE CÓDIGO 201).
+     * Determina o LADO da ordem para fechar a posição (RESOLVE CÓDIGO 201). [cite: 375]
+     * Este método se torna a fonte da Ação (BUY/SELL).
      */
     public OrderSide getClosingOrderSide() {
         // Se LONG -> Vende (SELL)

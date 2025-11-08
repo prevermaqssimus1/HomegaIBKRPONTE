@@ -144,6 +144,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             if (errorMessage != null && errorMessage.contains("201")) {
                 log.error("❌🚨 [Ponte IBKR | ERRO 201 MARGEM] Ordem {} rejeitada (Margem). Mensagem: {}",
                         ordemPrincipal.symbol(), errorMessage, e);
+                // Lança a exceção de domínio para o Principal (WebClient) capturar e ativar o Resgate.
                 throw new MarginRejectionException("Ordem rejeitada pela Corretora (IBKR Error 201). Liquidez não liberada.", e);
             }
 
@@ -308,11 +309,13 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             }
         }
         else {
+            // 🛑 TRATAMENTO CRÍTICO DE REJEIÇÃO ASSÍNCRONA
             if (errorCode == 201 || errorCode == 10243) {
                 log.error("🛑🛑🛑 [TWS-ERROR CRÍTICO ORDEM] ID: {} | CÓDIGO: {} | MENSAGEM: '{}'. AÇÃO IMEDIATA NECESSÁRIA.",
                         id, errorCode, errorMsg);
 
                 try {
+                    // ✅ SINERGIA: Envia a notificação para o Principal via Webhook.
                     webhookNotifier.sendOrderRejection(id, errorCode, errorMsg);
                     log.info("📤 Relatório de Rejeição (BrokerID: {}) ENVIADO via Webhook ao sistema Principal.", id);
                 } catch (Exception e) {
@@ -522,7 +525,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
 
             if (field == TickType.BID.index() || field == TickType.ASK.index() || field == TickType.LAST.index()) {
                 BigDecimal currentPrice = BigDecimal.valueOf(price);
-                log.debug("📢 [TWS-OUT] TICK PRICE recebido ({} | {}): R$ {}", symbol, TickType.getField(field), currentPrice);
                 webhookNotifier.sendMarketTick(symbol, currentPrice);
             }
         } catch (Exception e) {

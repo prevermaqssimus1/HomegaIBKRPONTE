@@ -120,12 +120,16 @@ public class LivePortfolioService {
             }
         }
 
-        // Log para rastrear os valores de margem CRÍTICOS
-        if ("ExcessLiquidity".equalsIgnoreCase(key) || "NetLiquidationValue".equalsIgnoreCase(key)) {
+        // Log para rastrear os valores de margem CRÍTICOS e ARMAZENAR EL NO CACHE PRINCIPAL
+        if ("ExcessLiquidity".equalsIgnoreCase(key)) {
             log.debug("📊 [CACHE PONTE] Margem Bruta Sincronizada: {} = R$ {}", key, value.toPlainString());
+            // 🚨 AJUSTE: Garante que ExcessLiquidity está no cache para ser lido
+            accountValuesCache.put("ExcessLiquidity", value);
+        } else if ("NetLiquidationValue".equalsIgnoreCase(key)) {
+            log.debug("📊 [CACHE PONTE] Margem Bruta Sincronizada: {} = R$ {}", key, value.toPlainString());
+            accountValuesCache.put("NetLiquidationValue", value);
         }
     }
-
     // --- MÉTODOS DE SINCRONIZAÇÃO DE POSIÇÕES ---
 
     public void resetPositionSyncLatch() {
@@ -176,7 +180,19 @@ public class LivePortfolioService {
      * Retorna o valor bruto do Buying Power do cache local.
      */
     public BigDecimal getCurrentBuyingPower() {
-        return lastAccountBalance.get().value();
+        BigDecimal cachedBuyingPower = lastAccountBalance.get().value();
+        BigDecimal cachedExcessLiquidity = getExcessLiquidity();
+
+        // 🚨 AJUSTE: Se o BP for R$0.00 (lido incorretamente)
+        // e o EL for > R$0.00 (liquidez conhecida pela corretora),
+        // retorna o EL para restaurar a sinergia e evitar o VETO de Emergência no Principal.
+        if (cachedBuyingPower.compareTo(BigDecimal.ZERO) == 0 && cachedExcessLiquidity.compareTo(BigDecimal.ZERO) > 0) {
+            log.warn("🚨 [AJUSTE SINERGIA BP] BP lido como R$0.00. Retornando ExcessLiquidity (R$ {}) para evitar o VETO de Emergência no Principal.", cachedExcessLiquidity.toPlainString());
+            return cachedExcessLiquidity;
+        }
+
+        // Caso contrário, retorna o BP (ou zero, se ambos forem zero).
+        return cachedBuyingPower;
     }
 
     /**

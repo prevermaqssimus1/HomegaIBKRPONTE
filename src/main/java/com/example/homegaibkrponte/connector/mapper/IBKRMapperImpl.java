@@ -1,10 +1,11 @@
 package com.example.homegaibkrponte.connector.mapper;
 
 import com.example.homegaibkrponte.model.Order;
-import com.example.homegaibkrponte.service.OrderIdManager; // SINERGIA: Para IDs de Ordem
+// Importação CRÍTICA: Assegura que estamos usando o enum da PONTE (MKT, LMT, STP)
+import com.example.homegaibkrponte.model.OrderType;
+import com.example.homegaibkrponte.service.OrderIdManager;
 import com.ib.client.Contract;
 import com.ib.client.Decimal;
-import com.ib.client.OrderType; // Importando o OrderType do IBKR
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -17,114 +18,98 @@ import java.util.Optional;
  * Implementação concreta do IBKRMapper, responsável por converter objetos de domínio (Ordem)
  * para objetos da API IBKR (Contract e com.ib.client.Order).
  * Implementa SRP e respeita o DIP (via interface IBKRMapper).
+ * * ✅ NOTA: Esta é a PONTE. O método mapOrderTypeAndPrices foi ajustado para depender
+ * unicamente do OrderType da Ponte (MKT, LMT, STP) e não dos tipos compostos do Principal.
  */
-@Component // ✅ Define esta classe como um Bean do Spring
+@Component
 @Slf4j
 @RequiredArgsConstructor
-// ✅ Implementa a interface que você definiu
 public class IBKRMapperImpl implements IBKRMapper {
 
-    // 💡 SINERGIA: Necessário para obter o próximo ID de ordem válido.
-    private final OrderIdManager orderIdManager;
+    private final OrderIdManager orderIdManager; // [cite: 34]
 
-    /**
-     * Converte o objeto Order do Principal para o objeto Contract da IBKR.
-     */
     @Override
-    public Contract toContract(Order domainOrder) {
+    public Contract toContract(Order domainOrder) { // [cite: 35]
         Contract contract = new Contract();
-
-        // 1. Definições básicas do Contrato
         contract.symbol(domainOrder.symbol());
-        contract.secType("STK"); // Assumindo ações (Stocks)
-        contract.exchange("SMART"); // Roteamento inteligente
-        contract.currency("USD"); // Moeda americana (Ajuste conforme sua necessidade)
-
-        // 2. Logs Explicativos (para rastrear a conversão)
+        contract.secType("STK"); // [cite: 37]
+        contract.exchange("SMART"); // [cite: 38]
+        contract.currency("USD"); // [cite: 39]
         log.info("⚙️ [PONTE | MAPPER] Mapeando Contrato para {}. Tipo: {}. Exchange: {}",
                 domainOrder.symbol(), contract.secType(), contract.exchange());
-
-        return contract;
+        return contract; // [cite: 40]
     }
 
-    /**
-     * Converte o objeto Order do Principal para o objeto Order nativo da IBKR.
-     */
     @Override
-    public com.ib.client.Order toIBKROrder(Order domainOrder) {
+    public com.ib.client.Order toIBKROrder(Order domainOrder) { // [cite: 41]
         com.ib.client.Order ibkrOrder = new com.ib.client.Order();
 
-        // 1. Obter o próximo ID Válido (SINERGIA CRÍTICA)
-        // Isso garante que cada ordem tenha um ID único antes de ser enviada.
-        int orderId = orderIdManager.getNextOrderId();
+        // 1. Obter o próximo ID Válido (SINERGIA CRÍTICA) [cite: 42]
+        int orderId = orderIdManager.getNextOrderId(); // [cite: 43]
         ibkrOrder.orderId(orderId);
-        ibkrOrder.clientId(orderIdManager.getClientId()); // Usa o ID do cliente da IBKR
-        ibkrOrder.account(orderIdManager.getAccountId()); // Usando o AccountId real do Manager (Melhor prática)
+        ibkrOrder.clientId(orderIdManager.getClientId());
+        ibkrOrder.account(orderIdManager.getAccountId()); // [cite: 44]
 
-        // 2. Quantidade e Ação
-        // Ação: Se a quantidade for positiva, é COMPRA. Se for negativa, é VENDA.
+        // 2. Quantidade e Ação (Resolvido pela quantidade)
         if (domainOrder.quantity().compareTo(BigDecimal.ZERO) > 0) {
-            ibkrOrder.action("BUY");
+            ibkrOrder.action("BUY"); // [cite: 45]
         } else {
-            ibkrOrder.action("SELL");
+            ibkrOrder.action("SELL"); // [cite: 46]
         }
 
-        // Quantidade (Deve ser sempre positiva na API IBKR, o sinal é dado pela AÇÃO)
-        ibkrOrder.totalQuantity(Decimal.get(domainOrder.quantity().abs()));
+        // Quantidade (Deve ser sempre positiva na API IBKR)
+        ibkrOrder.totalQuantity(Decimal.get(domainOrder.quantity().abs())); // [cite: 47]
 
-        // 3. Tipo de Ordem, Preço e Parâmetros (Lógica de Mapeamento do Enum)
-        mapOrderTypeAndPrices(domainOrder, ibkrOrder);
+        // 3. Tipo de Ordem, Preço e Parâmetros
+        mapOrderTypeAndPrices(domainOrder, ibkrOrder); // [cite: 48]
 
-        // 4. Logs Explicativos (para rastrear a ordem final)
+        // 4. Logs Explicativos
         log.debug("⚙️ [PONTE | MAPPER] Ordem IBKR mapeada: ID: {} | Ação: {} | Tipo: {} | Qtd: {}",
-                orderId, ibkrOrder.action(), ibkrOrder.orderType(), ibkrOrder.totalQuantity().value());
+                orderId, ibkrOrder.action(), ibkrOrder.orderType(), ibkrOrder.totalQuantity().value()); // [cite: 49]
 
-        return ibkrOrder;
+        return ibkrOrder; // [cite: 50]
     }
 
     /**
-     * Lógica complexa de mapeamento de tipos de ordem (Switch/Case).
+     * ✅ AJUSTADO PARA SINERGIA TOTAL: Foca apenas nos tipos de ordem da PONTE (MKT, LMT, STP).
+     * A lógica de intenção (BUY/SELL) e tipos compostos foi resolvida no Principal/OrderFactory.
      */
-    private void mapOrderTypeAndPrices(Order domainOrder, com.ib.client.Order ibkrOrder) {
+    private void mapOrderTypeAndPrices(Order domainOrder, com.ib.client.Order ibkrOrder) { // [cite: 51]
 
-        // Valor do preço (arredondado para duas casas decimais, prática comum em ações)
-        // Se o preço for nulo, usamos ZERO ou garantimos que não haja preço para ordens MKT.
-        BigDecimal price = Optional.ofNullable(domainOrder.price())
+        // Valor do preço para LMT ou STP (arredondado)
+        // Se o preço for nulo, usamos ZERO.
+        BigDecimal price = Optional.ofNullable(domainOrder.price()) // [cite: 52]
                 .orElse(BigDecimal.ZERO)
                 .setScale(2, RoundingMode.HALF_UP);
 
+        // O switch utiliza o OrderType do DOMÍNIO (que deve ser MKT, LMT, STP, conforme o enum da Ponte)
         switch (domainOrder.type()) {
-            case BUY_MARKET:
-            case SELL_MARKET:
-                ibkrOrder.orderType(com.ib.client.OrderType.MKT.name());
+            case MKT:
+                // BUY_MARKET e SELL_MARKET já estão mapeados para MKT e a ação está acima.
+                ibkrOrder.orderType(com.ib.client.OrderType.MKT.name()); // [cite: 54]
+                // MKT não usa lmtPrice ou auxPrice
                 break;
-            case BUY_LIMIT:
-            case SELL_LIMIT:
-                ibkrOrder.orderType(com.ib.client.OrderType.LMT.name());
+
+            case LMT:
+                // BUY_LIMIT e SELL_LIMIT já estão mapeados para LMT e a ação está acima.
+                ibkrOrder.orderType(com.ib.client.OrderType.LMT.name()); // [cite: 55]
                 ibkrOrder.lmtPrice(price.doubleValue());
                 break;
-            case BUY_STOP:
-            case SELL_STOP:
-                ibkrOrder.orderType(com.ib.client.OrderType.STP.name());
-                ibkrOrder.auxPrice(price.doubleValue()); // Preço Stop
+
+            case STP:
+                // BUY_STOP e SELL_STOP já estão mapeados para STP e a ação está acima.
+                ibkrOrder.orderType(com.ib.client.OrderType.STP.name()); // [cite: 56]
+                // Assumimos que o campo 'price' do domínio contém o preço Stop para STP simples.
+                ibkrOrder.auxPrice(price.doubleValue());
                 break;
-            case BUY_TO_COVER:
-                ibkrOrder.orderType(com.ib.client.OrderType.MKT.name());
-                ibkrOrder.action("BUY");
-                break;
-            case STOP_LOSS:
-            case SELL_STOP_LOSS:
-                ibkrOrder.orderType(com.ib.client.OrderType.STP.name());
-                ibkrOrder.auxPrice(domainOrder.stopLossPrice().doubleValue());
-                break;
-            case TAKE_PROFIT:
-            case SELL_TAKE_PROFIT:
-                ibkrOrder.orderType(com.ib.client.OrderType.LMT.name());
-                ibkrOrder.lmtPrice(domainOrder.takeProfitPrice().doubleValue());
-                break;
+
+            // 🛑 REMOVIDOS OS ENUMS COMPOSTOS (Ex: BUY_MARKET, SELL_STOP_LOSS)
+            // Eles pertencem à lógica de intenção no Principal.
+            // O record Order deve ter OrderType = MKT/LMT/STP.
+
             default:
-                log.error("❌ [PONTE | MAPPER] Tipo de ordem desconhecido ou não suportado: {}", domainOrder.type());
-                ibkrOrder.orderType(com.ib.client.OrderType.MKT.name());
+                log.error("❌ [PONTE | MAPPER] Tipo de ordem da Ponte desconhecido ou não suportado: {}", domainOrder.type()); // [cite: 60]
+                ibkrOrder.orderType(com.ib.client.OrderType.MKT.name()); // [cite: 61]
         }
     }
 }

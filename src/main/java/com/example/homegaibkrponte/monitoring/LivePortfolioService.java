@@ -29,7 +29,6 @@ import java.util.stream.Collectors;
 
 /**
  * 🌉 **PONTE (BRIDGE):** Responsável por ser o cache local e o sink para os dados brutos da conta IBKR.
- * [CORRIGIDO]: Assinaturas de métodos de execução ajustadas para o TradeExecutedEvent, resolvendo os erros de compilação.
  */
 @Service
 @Slf4j
@@ -56,6 +55,9 @@ public class LivePortfolioService {
 
     // Cache para todos os valores de conta (Incluindo EL e NLV)
     private final ConcurrentHashMap<String, BigDecimal> accountValuesCache = new ConcurrentHashMap<>();
+
+    // ✅ CHAVE CRÍTICA
+    private static final String KEY_NET_LIQUIDATION = "NetLiquidationValue";
 
     public LivePortfolioService(ApplicationEventPublisher eventPublisher) {
         this.eventPublisher = eventPublisher;
@@ -123,13 +125,36 @@ public class LivePortfolioService {
         // Log para rastrear os valores de margem CRÍTICOS e ARMAZENAR EL NO CACHE PRINCIPAL
         if ("ExcessLiquidity".equalsIgnoreCase(key)) {
             log.debug("📊 [CACHE PONTE] Margem Bruta Sincronizada: {} = R$ {}", key, value.toPlainString());
-            // 🚨 AJUSTE: Garante que ExcessLiquidity está no cache para ser lido
             accountValuesCache.put("ExcessLiquidity", value);
-        } else if ("NetLiquidationValue".equalsIgnoreCase(key)) {
+        } else if (KEY_NET_LIQUIDATION.equalsIgnoreCase(key)) { // ✅ AJUSTE AQUI
             log.debug("📊 [CACHE PONTE] Margem Bruta Sincronizada: {} = R$ {}", key, value.toPlainString());
-            accountValuesCache.put("NetLiquidationValue", value);
+            accountValuesCache.put(KEY_NET_LIQUIDATION, value);
         }
     }
+
+    // =========================================================================
+    // ✅ NOVO MÉTODO: ATUALIZAÇÃO DO NLV USANDO CHAVE CONSISTENTE
+    // =========================================================================
+
+    /**
+     * 📥 Atualiza o Net Liquidation Value (PL) no cache SSOT da Ponte.
+     * Este é o método que deve ser chamado pelo IBKRConnector, independentemente
+     * do nome exato do campo que o TWS enviou (ex: 'NetLiquidation' ou 'NetLiquidationValue').
+     * @param nlv O valor do Net Liquidation Value a ser armazenado.
+     */
+    public void updateNetLiquidationValueFromCallback(BigDecimal nlv) {
+        try {
+            if (nlv != null && nlv.compareTo(BigDecimal.ZERO) > 0) {
+                accountValuesCache.put(KEY_NET_LIQUIDATION, nlv);
+                log.info("✅ [PONTE | SYNC NLV] Net Liquidation Value (PL) atualizado via callback: R$ {}", nlv.toPlainString());
+            } else {
+                log.warn("⚠️ [PONTE | SYNC NLV] Tentativa de atualização do NLV com valor inválido ou nulo. Valor recebido: {}", nlv);
+            }
+        } catch (Exception e) {
+            log.error("❌ [PONTE | ERRO SYNC] Erro ao atualizar Net Liquidation Value no cache.", e);
+        }
+    }
+
     // --- MÉTODOS DE SINCRONIZAÇÃO DE POSIÇÕES ---
 
     public void resetPositionSyncLatch() {
@@ -148,7 +173,6 @@ public class LivePortfolioService {
                         this::mapPositionDTOtoDomain,
                         (existingValue, newValue) -> newValue
                 ));
-
         portfolioState.getAndUpdate(current -> current.toBuilder()
                 .openPositions(new ConcurrentHashMap<>(newPositionsMap))
                 .build()
@@ -196,6 +220,21 @@ public class LivePortfolioService {
     }
 
     /**
+     * Retorna o Net Liquidation Value (PL) do cache SSOT da Ponte.
+     * @return O valor do NLV, ou zero se não estiver populado.
+     */
+    public BigDecimal getNetLiquidationValue() {
+        try {
+            BigDecimal nlv = accountValuesCache.getOrDefault(KEY_NET_LIQUIDATION, BigDecimal.ZERO);
+            log.debug("💰 [PONTE | SSOT PL] Retornando Net Liquidation Value (PL) do cache: R$ {}", nlv.toPlainString());
+            return nlv;
+        } catch (Exception e) {
+            log.error("❌ [PONTE | ERRO SSOT] Falha ao obter Net Liquidation Value do cache. Retornando Zero.", e);
+            return BigDecimal.ZERO;
+        }
+    }
+
+    /**
      * Busca uma posição aberta no snapshot.
      */
     public Optional<Position> getPosition(String symbol) {
@@ -235,7 +274,18 @@ public class LivePortfolioService {
     private Position mapPositionDTOtoDomain(PositionDTO dto) {
         BigDecimal quantity = dto.getPosition().abs();
         PositionDirection direction = dto.getPosition().signum() > 0 ? PositionDirection.LONG : PositionDirection.SHORT;
-        return new Position(dto.getTicker(), quantity, dto.getMktPrice(), LocalDateTime.now(), direction, null, null, "Sincronizado via TWS");
+
+        // ✅ CORRIGIDO: Usando o builder para criar Position
+        return Position.builder()
+                .symbol(dto.getTicker())
+                .quantity(quantity)
+                .averageEntryPrice(dto.getMktPrice())
+                .entryTime(LocalDateTime.now())
+                .direction(direction)
+                .stopLoss(null) // Campos opcionais explicitamente nulos
+                .takeProfit(null)
+                .rationale("Sincronizado via TWS")
+                .build();
     }
 
     // 🚨 AJUSTE DE ASSINATURA: Métodos perform* agora aceitam apenas TradeExecutedEvent
@@ -253,7 +303,12 @@ public class LivePortfolioService {
         newPositions.put(symbol, newPosition);
 
         log.warn("✅ [PORTFÓLIO LIVE] NOVA VENDA A DESCOBERTO (SHORT) para {} registrada. Novo saldo: R$ {}", symbol, newCash.setScale(2, RoundingMode.HALF_UP));
-        return new Portfolio(current.symbolForBacktest(), newCash, newPositions, current.tradeHistory());
+
+        return current.toBuilder()
+                .cashBalance(newCash)
+                .openPositions(newPositions)
+                // tradeHistory() é mantido, mas o builder lida com ele
+                .build();
     }
 
     private Portfolio performShortCoverExecution(Portfolio current, TradeExecutedEvent event) {
@@ -371,8 +426,6 @@ public class LivePortfolioService {
     public void onTradeExecuted(TradeExecutedEvent event) {
         log.info("🎧 Evento de trade recebido: Fonte [{}], Símbolo [{}], Lado [{}], Qtd [{}], Preço [R$ {}]",
                 event.executionSource(), event.symbol(), event.side(), event.quantity(), event.price());
-
-        // A Ponte não deve ter lógica de mirrorPaperTrades, mas a lógica de execução deve ser mantida.
 
         // Lógica de atualização de portfólio atômica (Princípio da Imutabilidade)
         portfolioState.getAndUpdate(currentPortfolio -> {

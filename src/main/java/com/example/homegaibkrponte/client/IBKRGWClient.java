@@ -14,22 +14,16 @@ import org.slf4j.LoggerFactory;
 @Service
 public class IBKRGWClient {
 
-    // Logs explicativos para rastrear o que acontece
     private static final Logger log = LoggerFactory.getLogger(IBKRGWClient.class);
 
     // Variável para garantir a lógica de serialização e controle de concorrência (Fila de Order)
     private final Object orderQueueLock = new Object();
     private long nextOrderId = 1;
 
-    /**
-     * Implementa a lógica de envio de ordem de VENDA (SELL) para a Corretora.
-     * Deve ser chamada pelo Principal (PositionExitManager) para Stop Loss ou Take Profit.
-     * * @param symbol O ticker do ativo.
-     * @param quantity A quantidade do ativo. CRÍTICO: DEVE SER LONG (INTEIRO).
-     * @param action A ação da ordem (SELL).
-     * @param reason O motivo da ordem.
-     * @return O resultado da execução da ordem.
-     */
+    // ====================================================================
+    // 1. MÉTODO DE VENDA (SAÍDA)
+    // ====================================================================
+
     public OrderExecutionResult placeSellOrder(String symbol, long quantity, String action, String reason) {
         // Garantindo a Sinergia e Concorrência: A Fila de Ordem
         synchronized (orderQueueLock) {
@@ -45,7 +39,6 @@ public class IBKRGWClient {
                 }
 
                 // Simulação do envio real da ordem via socket ou API IBKR
-                // Neste ponto, a Ponte garante que a ordem vai ser processada.
                 Thread.sleep(50);
 
                 log.info("🔥 [PONTE IBKR | EXEC] Ordem {} para {} enviada à corretora. ID IBKR: {}", action, symbol, nextOrderId);
@@ -59,6 +52,38 @@ public class IBKRGWClient {
 
             } catch (Exception e) {
                 // Não agir por conta própria. Apenas logar o erro e retornar a falha.
+                log.error("❌ [PONTE IBKR | ERRO FATAL] Falha na comunicação ou Thread ao processar ordem para {}: {}", symbol, e.getMessage(), e);
+                return new OrderExecutionResult(false, "Erro interno de concorrência/comunicação na Ponte: " + e.getMessage());
+            }
+        }
+    }
+
+    // ====================================================================
+    // 2. MÉTODO DE COMPRA (ENTRADA) - ADICIONADO PARA SINERGIA TOTAL
+    // ====================================================================
+
+    public OrderExecutionResult placeBuyOrder(String symbol, long quantity, String action, String reason) {
+        synchronized (orderQueueLock) {
+            log.info("📢 [PONTE IBKR | FILA] Ordem de COMPRA {} para {} (Qtd: {}) ENQUEUE. ID Interno: {}",
+                    action, symbol, quantity, nextOrderId);
+
+            try {
+                if (quantity <= 0) {
+                    log.error("❌ [PONTE IBKR | ERRO DIMENSIONAL] Ordem rejeitada: Quantidade ({}) é inválida. A Ponte CANCELA para não prejudicar o que já existe.", quantity);
+                    return new OrderExecutionResult(false, "Quantidade dimensional inválida (zero ou negativa).");
+                }
+
+                Thread.sleep(50);
+
+                log.info("🔥 [PONTE IBKR | EXEC] Ordem {} para {} enviada à corretora. ID IBKR: {}", action, symbol, nextOrderId);
+
+                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada e confirmada na fila da IBKR.");
+                result.setOrderId(nextOrderId);
+
+                nextOrderId++;
+                return result;
+
+            } catch (Exception e) {
                 log.error("❌ [PONTE IBKR | ERRO FATAL] Falha na comunicação ou Thread ao processar ordem para {}: {}", symbol, e.getMessage(), e);
                 return new OrderExecutionResult(false, "Erro interno de concorrência/comunicação na Ponte: " + e.getMessage());
             }

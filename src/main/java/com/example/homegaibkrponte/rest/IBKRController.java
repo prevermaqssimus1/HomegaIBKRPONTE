@@ -1,7 +1,9 @@
+// File: src/main/java/com/example/homegaibkrponte/rest/IBKRController.java (Atualizado)
 package com.example.homegaibkrponte.rest;
 
 import com.example.homegaibkrponte.connector.IBKRConnector;
 import com.example.homegaibkrponte.dto.OrderDTO;
+import com.example.homegaibkrponte.dto.MarginWhatIfResponseDTO; // Importação do novo DTO
 import com.example.homegaibkrponte.model.Position;
 import com.example.homegaibkrponte.model.PositionDTO;
 import com.example.homegaibkrponte.monitoring.LivePortfolioService;
@@ -32,8 +34,6 @@ public class IBKRController {
     private final OrderService orderService;
     private final LivePortfolioService portfolioService;
     private final OrderIdManager orderIdManager;
-    // ✅ OBSERVAÇÃO: A dependência 'accountService' foi removida,
-    // e o requestAccountSummarySnapshot será feito via 'connector'.
 
     @GetMapping("/status")
     public ResponseEntity<String> getStatus() {
@@ -72,7 +72,6 @@ public class IBKRController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
-
 
     /**
      * ✅ CORRIGIDO: Este método agora busca o poder de compra em tempo real a cada requisição.
@@ -244,4 +243,91 @@ public class IBKRController {
 
     // Classe interna para a resposta do ID da ordem
     private record NextOrderIdResponse(int nextOrderId) {}
+
+    @GetMapping("/margin/nlv")
+    public ResponseEntity<BigDecimal> getNetLiquidationValue() {
+        // Aplica try-catch e logs explicativos (Obrigatório)
+        try {
+            // Assume-se que o NLV do dia anterior pode ser espelhado pelo NLV mais fresco,
+            // que é armazenado no cache da Ponte durante a sincronização.
+            BigDecimal netLiquidation = portfolioService.getNetLiquidationValue();
+
+            if (netLiquidation.compareTo(BigDecimal.ZERO) <= 0) {
+                log.warn("⚠️ [Ponte | NLV] Net Liquidation Value (NLV) retornou R$ 0.00. Assumindo que o dado é do dia anterior, mas está indisponível/zerado. Veto de Sizing possível no Principal.");
+            }
+
+            log.info("✅ [Ponte | NLV] Retornando Net Liquidation Value (PL) para o Principal: R$ {}", netLiquidation);
+            return ResponseEntity.ok(netLiquidation);
+
+        } catch (Exception e) {
+            log.error("❌ [Ponte | ERRO NLV] Falha crítica ao obter Net Liquidation Value (PL). Forçando R$ 0.00. Rastreando.", e);
+            // Retorna ZERO, forçando o veto no Sizing do Principal (Fail-safe, mais seguro que um valor incorreto).
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
+        }
+    }
+
+
+
+
+    @PostMapping("/margin/what-if")
+    public ResponseEntity<MarginWhatIfResponseDTO> requestMarginWhatIf(@RequestBody MarginWhatIfRequest request) {
+        log.info("➡️ [Ponte | Controller] Recebida requisição REST de What-If para {} (Qty: {}).", request.symbol(), request.quantity());
+
+        // Conversão obrigatória para o DTO de resposta (alinha com a sinergia de tipos)
+        BigDecimal requestQuantityBd = new BigDecimal(request.quantity());
+
+        if (!connector.isConnected()) {
+            log.error("❌ [Ponte | What-If] Conexão com TWS inativa. Retornando erro de serviço indisponível.");
+            // Linha 285 (Exemplo): Construtor DTO com 7 argumentos e BigDecimal
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(
+                    new MarginWhatIfResponseDTO(
+                            request.symbol(),
+                            requestQuantityBd, // ✅ Tipo BigDecimal
+                            BigDecimal.ZERO,
+                            BigDecimal.ZERO,
+                            BigDecimal.ZERO, // commissionEstimate
+                            null,            // currency
+                            "Conexão com a corretora indisponível."
+                    )
+            );
+        }
+
+        try {
+            // ✅ CHAMADA À PONTE (Bridge)
+            // A assinatura do request.quantity() aqui deve ser compatível com o connector.requestMarginWhatIf(String, int)
+            // Se o request.quantity() for int, passe-o; se for BigDecimal, ajuste o método do connector.
+            MarginWhatIfResponseDTO response = connector.requestMarginWhatIf(request.symbol(), request.quantity());
+
+            // Log de retorno
+            if (response.error() != null && !response.error().isEmpty()) {
+                log.warn("⚠️ [Ponte | What-If] Simulação What-If para {} retornou erro do TWS: {}", request.symbol(), response.error());
+            } else {
+                log.info("✅ [Ponte | What-If] Simulação What-If para {} retornou sucesso. Mudança Margem Inicial: R$ {}",
+                        request.symbol(), response.initialMarginChange());
+            }
+
+            return ResponseEntity.ok(response);
+
+        } catch (Exception e) {
+            log.error("❌ [Ponte | ERRO What-If] Falha CRÍTICA ao processar What-If para {}. Rastreando.", request.symbol(), e);
+            // Linha 322 (Exemplo): Construtor DTO com 7 argumentos e BigDecimal
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
+                    new MarginWhatIfResponseDTO(
+                            request.symbol(),
+                            requestQuantityBd, // ✅ Tipo BigDecimal
+                            BigDecimal.ZERO,
+                            BigDecimal.ZERO,
+                            BigDecimal.ZERO, // commissionEstimate
+                            null,            // currency
+                            "Erro interno da Ponte ao executar What-If: " + e.getMessage()
+                    )
+            );
+        }
+    }
+
+
+
+
+    // Classe interna para mapear a requisição de What-If (Obrigatório: Records para DTOs)
+    private record MarginWhatIfRequest(String symbol, int quantity) {}
 }

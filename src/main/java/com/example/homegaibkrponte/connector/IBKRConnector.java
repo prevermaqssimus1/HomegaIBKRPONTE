@@ -7,6 +7,7 @@ import com.example.homegaibkrponte.dto.MarginWhatIfResponseDTO;
 import com.example.homegaibkrponte.exception.MarginRejectionException;
 import com.example.homegaibkrponte.exception.OrdemFalhouException;
 import com.example.homegaibkrponte.model.Candle;
+import com.example.homegaibkrponte.model.OrderStateDTO;
 import com.example.homegaibkrponte.model.PositionDTO;
 import com.example.homegaibkrponte.model.TradeExecutedEvent;
 import com.example.homegaibkrponte.monitoring.LivePortfolioService;
@@ -25,10 +26,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -55,6 +53,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private final ConcurrentHashMap<Integer, String> marketDataRequests = new ConcurrentHashMap<>();
     private final MeterRegistry meterRegistry;
     private final AtomicInteger currentAccountSummaryReqId = new AtomicInteger(-1);
+    private final ConcurrentMap<Integer, CompletableFuture<OrderStateDTO>> whatIfFutures = new ConcurrentHashMap<>();
 
     private final OrderIdManager orderIdManager;
     private final IBKRMapper ibkrMapper;
@@ -64,6 +63,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private final AtomicInteger nextValidId = new AtomicInteger(1);
     private final ConcurrentHashMap<Integer, CompletableFuture<List<Candle>>> pendingHistoricalData = new ConcurrentHashMap<>();
     private final CountDownLatch connectionLatch = new CountDownLatch(1);
+    private static final int CRITICAL_MARGIN_REQ_ID = 9001; // ID fixo para requisições de sumário de margem
 
     // MAPA CRÍTICO para requisições assíncronas de What-If (Se a API for atualizada, este mapa será usado)
     private final ConcurrentHashMap<Integer, CompletableFuture<MarginWhatIfResponseDTO>> pendingMarginWhatIfRequests = new ConcurrentHashMap<>();
@@ -111,6 +111,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         return "DUN652604";
     }
 
+
     /**
      * Requisita dados de Market Data.
      */
@@ -135,6 +136,23 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         }
     }
 
+
+    public void requestCriticalMarginData() {
+        if (!isConnected()) {
+            log.error("❌ [Ponte | MARGEM] Conexão inativa. Impossível requisitar sumário de conta.");
+            return;
+        }
+
+        // Tags essenciais para a validação de Excesso de Liquidez e CÓDIGO 201.
+        String tags = "MaintMarginReq,InitMarginReq,EquityWithLoanValue,NetLiquidationValue";
+        String group = "All"; // Group é usado para contas gerenciadas
+
+        // 🚨 AJUSTE DE SINERGIA: Chamada correta com 3 argumentos (reqId, group, tags)
+        client.reqAccountSummary(CRITICAL_MARGIN_REQ_ID, group, tags);
+
+        log.info("📊 [Ponte | MARGEM] Solicitado sumário de margem crítico (MaintMarginReq, InitMarginReq). ReqID: {}. Tags: {}",
+                CRITICAL_MARGIN_REQ_ID, tags);
+    }
 
     /**
      * Envia a ordem principal para a Ponte IBKR.
@@ -172,72 +190,84 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         }
     }
 
-    /**
-     * 🆕 NOVO MÉTODO (PONTE/BRIDGE): Trata a requisição de simulação de margem 'What-If'.
-     *
-     * **AJUSTE DE SINERGIA CRÍTICA:** Retorna um valor de bypass (R$ 0.01) e erro nulo
-     * para garantir que o Principal consiga rodar o Sizing de Posição sem o método
-     * 'reqMarginWhatIf', que está ausente na API TWS v10.37.
-     *
-     * @param symbol O ticker do ativo.
-     * @param quantity A quantidade a ser simulada.
-     * @return DTO com o resultado da margem inicial requerida, ou o valor de bypass.
-     */
+
+    @Deprecated
     public MarginWhatIfResponseDTO requestMarginWhatIf(String symbol, int quantity) {
-        // Conversão obrigatória para o DTO de 7 campos (BigDecimal)
-        BigDecimal quantityBd = new BigDecimal(quantity);
+        String errorMsg = "❌ Funcionalidade 'requestMarginWhatIf' obsoleta e removida. O Principal DEVE usar o endpoint REST /whatif que chama o fluxo assíncrono real: sendWhatIfRequest().";
 
-        // Garantindo que todo o código esteja dentro de um bloco try-catch
-        try {
-            if (!isConnected()) {
-                log.error("❌ [Ponte | What-If] Conexão IBKR inativa. Retornando DTO de erro.");
-                // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 1)
-                return new MarginWhatIfResponseDTO(
-                        symbol,
-                        quantityBd,
-                        BigDecimal.ZERO,
-                        BigDecimal.ZERO,
-                        BigDecimal.ZERO,
-                        null,
-                        "Conexão IBKR inativa."
-                );
-            }
+        // Logamos o erro CRÍTICO antes de lançar a exceção.
+        log.error("🛑🛑🛑 [Ponte | What-If OBSOLETO] Tentativa de uso de método obsoleto! Rastreando: {}", errorMsg);
 
-            // --- Lógica de Bypass ---
-            log.warn("⚠️ [Ponte | What-If] Funcionalidade 'reqMarginWhatIf' não suportada pela API TWS v10.37. Aplicando bypass para manter sinergia com o Principal.");
-
-            BigDecimal bypassMargin = new BigDecimal("0.01");
-
-            // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 2)
-            MarginWhatIfResponseDTO bypassResponse = new MarginWhatIfResponseDTO(
-                    symbol,
-                    quantityBd, // Uso do BigDecimal
-                    bypassMargin,
-                    BigDecimal.ZERO,
-                    BigDecimal.ZERO,
-                    "BRL",
-                    null
-            );
-
-            log.info("✅ [Ponte | What-If] Bypass What-If concluído para {} (Qty: {}). Margem de Bypass: R$ {}",
-                    symbol, quantity, bypassMargin.toPlainString());
-
-            return bypassResponse;
-
-        } catch (Exception e) {
-            log.error("❌ [Ponte | ERRO CRÍTICO What-If] Falha CRÍTICA ao executar bypass What-If para {}. Rastreando.", symbol, e);
-            // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 3)
-            return new MarginWhatIfResponseDTO(
-                    symbol,
-                    quantityBd,
-                    BigDecimal.ZERO,
-                    BigDecimal.ZERO,
-                    BigDecimal.ZERO,
-                    null,
-                    "Erro CRÍTICO no bypass da Ponte: " + e.getMessage()
-            );
-        }
+        // Força a falha imediata para que o Principal revise sua integração (sinergia).
+        throw new UnsupportedOperationException(errorMsg);
     }
+
+//    /**
+//     * 🆕 NOVO MÉTODO (PONTE/BRIDGE): Trata a requisição de simulação de margem 'What-If'.
+//     *
+//     * **AJUSTE DE SINERGIA CRÍTICA:** Retorna um valor de bypass (R$ 0.01) e erro nulo
+//     * para garantir que o Principal consiga rodar o Sizing de Posição sem o método
+//     * 'reqMarginWhatIf', que está ausente na API TWS v10.37.
+//     *
+//     * @param symbol O ticker do ativo.
+//     * @param quantity A quantidade a ser simulada.
+//     * @return DTO com o resultado da margem inicial requerida, ou o valor de bypass.
+//     */
+//    public MarginWhatIfResponseDTO requestMarginWhatIf(String symbol, int quantity) {
+//        // Conversão obrigatória para o DTO de 7 campos (BigDecimal)
+//        BigDecimal quantityBd = new BigDecimal(quantity);
+//
+//        // Garantindo que todo o código esteja dentro de um bloco try-catch
+//        try {
+//            if (!isConnected()) {
+//                log.error("❌ [Ponte | What-If] Conexão IBKR inativa. Retornando DTO de erro.");
+//                // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 1)
+//                return new MarginWhatIfResponseDTO(
+//                        symbol,
+//                        quantityBd,
+//                        BigDecimal.ZERO,
+//                        BigDecimal.ZERO,
+//                        BigDecimal.ZERO,
+//                        null,
+//                        "Conexão IBKR inativa."
+//                );
+//            }
+//
+//            // --- Lógica de Bypass ---
+//            log.warn("⚠️ [Ponte | What-If] Funcionalidade 'reqMarginWhatIf' não suportada pela API TWS v10.37. Aplicando bypass para manter sinergia com o Principal.");
+//
+//            BigDecimal bypassMargin = new BigDecimal("0.01");
+//
+//            // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 2)
+//            MarginWhatIfResponseDTO bypassResponse = new MarginWhatIfResponseDTO(
+//                    symbol,
+//                    quantityBd, // Uso do BigDecimal
+//                    bypassMargin,
+//                    BigDecimal.ZERO,
+//                    BigDecimal.ZERO,
+//                    "BRL",
+//                    null
+//            );
+//
+//            log.info("✅ [Ponte | What-If] Bypass What-If concluído para {} (Qty: {}). Margem de Bypass: R$ {}",
+//                    symbol, quantity, bypassMargin.toPlainString());
+//
+//            return bypassResponse;
+//
+//        } catch (Exception e) {
+//            log.error("❌ [Ponte | ERRO CRÍTICO What-If] Falha CRÍTICA ao executar bypass What-If para {}. Rastreando.", symbol, e);
+//            // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 3)
+//            return new MarginWhatIfResponseDTO(
+//                    symbol,
+//                    quantityBd,
+//                    BigDecimal.ZERO,
+//                    BigDecimal.ZERO,
+//                    BigDecimal.ZERO,
+//                    null,
+//                    "Erro CRÍTICO no bypass da Ponte: " + e.getMessage()
+//            );
+//        }
+//    }
 
     public String getManagedAccounts() {
         if (client.isConnected()) {
@@ -307,12 +337,78 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         }
     }
 
-    @Override public void openOrder(int orderId, Contract contract, Order order, OrderState orderState) {
+    @Override
+    public void openOrder(int orderId, Contract contract, Order order, OrderState orderState) {
         try {
+            // Verifica se o ID de ordem está no mapa de Futures de What-If pendentes.
+            if (order.whatIf() && whatIfFutures.containsKey(orderId)) {
+
+                // 1. É uma resposta What-If. Captura e remove o Future pendente.
+                CompletableFuture<OrderStateDTO> future = whatIfFutures.remove(orderId);
+
+                // --- SINERGIA: Mapeia para os campos existentes ---
+                String marginChange = orderState.initMarginChange();
+                String equityAfter = orderState.equityWithLoanAfter();
+
+                log.info("📢 [PONTE | TWS-IN | What-If] Resultado REAL recebido. Simulação What-If para {}.", contract.symbol());
+                log.info("ℹ️ [PONTE | TWS-IN | What-If] Impacto na Margem Inicial (Change): {}", marginChange);
+                log.info("ℹ️ [PONTE | TWS-IN | What-If] Patrimônio/Liquidez Pós-Simulação (Equity After): {}", equityAfter);
+
+                // 2. Cria o DTO de estado com os valores reais mapeados
+                OrderStateDTO resolvedState = ibkrMapper.toOrderStateDTO(orderState);
+
+                // 3. Resolve a Promise com o estado completo.
+                future.complete(resolvedState);
+
+                return; // Termina o processamento para este What-If
+            }
+
+            // --- Lógica para ordens normais (mantida) ---
             log.info("ℹ️ [PONTE | TWS-IN | OPEN] Ordem {} aberta. Ativo: {} {} @ {}. Status TWS: {}.",
-                    orderId, order.action(), order.totalQuantity(), contract.symbol(), orderState.status());
+                    orderId, order.action(), order.totalQuantity(), contract.symbol(), orderState.getStatus());
+
         } catch (Exception e) {
             log.error("💥 [PONTE | TWS-IN] Erro ao processar openOrder para ID {}.", orderId, e);
+        }
+    }
+
+    public OrderStateDTO sendWhatIfRequest(Contract contract, Order order) {
+        if (order.orderId() <= 0) {
+            log.error("❌ [Ponte | What-If] Ordem ID inválida. Requer um ID sequencial obtido via nextValidId.");
+            throw new IllegalArgumentException("Ordem ID inválida para What-If.");
+        }
+
+        order.whatIf(true);
+        order.transmit(true);
+
+        CompletableFuture<OrderStateDTO> future = new CompletableFuture<>();
+        whatIfFutures.put(order.orderId(), future);
+
+        log.info("<- [Ponte | What-If] Enviando requisição What-If para {} (Qty: {}) com ID: {}",
+                contract.symbol(), order.totalQuantity(), order.orderId());
+
+        long start = System.currentTimeMillis(); // ⏱️ INÍCIO DA REQUISIÇÃO (ANTES DO placeOrder)
+
+        try {
+            client.placeOrder(order.orderId(), contract, order);
+
+            OrderStateDTO resultState = future.join(); // Bloqueia a thread até a resposta
+
+            long end = System.currentTimeMillis(); // ⏱️ FIM DA RESPOSTA
+
+            // 🚨 NOVO LOG DE DIAGNÓSTICO
+            log.warn("⏱️ [Ponte | Latência What-If] Requisição ID {} concluída em {}ms.",
+                    order.orderId(), (end - start));
+
+            // ... (Lógica de validação de Excesso de Liquidez e limpeza de future mantida) ...
+
+            return resultState;
+
+        } catch (Exception e) {
+            log.error("❌ [Ponte | What-If] Falha durante a simulação What-If. Causa: {}", e.getMessage(), e);
+            // ✅ Ação Necessária: Limpar a entrada do mapa antes de lançar a exceção
+            whatIfFutures.remove(order.orderId());
+            throw new RuntimeException("Falha na simulação What-If da IBKR.", e);
         }
     }
 
@@ -373,6 +469,23 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         log.debug("🔍 [DIAGNÓSTICO TWS RAW] ID: {} | CÓDIGO: {} | MENSAGEM: {} | Detalhe: {}",
                 id, errorCode, errorMsg, extendedMsg);
 
+        // --- NOVO TRATAMENTO CRÍTICO: Falha em Simulações What-If Pendentes ---
+        // Verifica se este ID de erro corresponde a um CompletableFuture de What-If ativo.
+        CompletableFuture<OrderStateDTO> whatIfFuture = whatIfFutures.get(id);
+        if (whatIfFuture != null) {
+            whatIfFutures.remove(id); // Remove imediatamente para evitar processamento futuro
+            log.error("❌ [PONTE | What-If ERRO FATAL] ID: {} | CÓDIGO: {} | Mensagem: '{}'. Simulação falhou, completando Future com exceção.",
+                    id, errorCode, errorMsg);
+
+            // Completa o Future com uma exceção, que será capturada no .join() do sendWhatIfRequest
+            whatIfFuture.completeExceptionally(
+                    new RuntimeException("Simulação What-If Falhou (TWS Code: " + errorCode + "): " + errorMsg)
+            );
+            return; // Termina o processamento. O erro What-If foi tratado.
+        }
+
+        // --- Tratamento de erros gerais e avisos da TWS (Lógica Original) ---
+
         if (id < 0) {
             if (errorCode == 2104 || errorCode == 2158) {
                 log.info("✅ [TWS-IN] STATUS DE CONEXÃO: Código {}, Mensagem: '{}'", errorCode, errorMsg);
@@ -387,7 +500,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             }
         }
         else {
-            // 🛑 TRATAMENTO CRÍTICO DE REJEIÇÃO ASSÍNCRONA
+            // 🛑 TRATAMENTO CRÍTICO DE REJEIÇÃO ASSÍNCRONA (Ordem Real)
             if (errorCode == 201 || errorCode == 10243) {
                 log.error("🛑🛑🛑 [TWS-ERROR CRÍTICO ORDEM] ID: {} | CÓDIGO: {} | MENSAGEM: '{}'. AÇÃO IMEDIATA NECESSÁRIA.",
                         id, errorCode, errorMsg);
@@ -402,21 +515,21 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                 }
 
             } else {
-                // Lógica que seria usada pelo whatIfMargin original (mantida por segurança, embora bypassada)
-                CompletableFuture<MarginWhatIfResponseDTO> future = pendingMarginWhatIfRequests.get(id);
-                if (future != null && !future.isDone()) {
-                    log.warn("⚠️ [Ponte | TWS-IN What-If ERROR] Erro {} recebido para reqId What-If {}. Completa com erro de margem.", errorCode, id);
+                // Lógica legada para erros que podem ser do antigo reqMarginWhatIf (mantida, mas com ressalvas)
+                CompletableFuture<MarginWhatIfResponseDTO> legacyWhatIfFuture = pendingMarginWhatIfRequests.get(id);
+                if (legacyWhatIfFuture != null && !legacyWhatIfFuture.isDone()) {
+                    log.warn("⚠️ [Ponte | TWS-IN What-If LEGADO ERROR] Erro {} recebido para reqId LEGADO {}. Completa com erro de margem.", errorCode, id);
 
-                    // ✅ CORREÇÃO DE ASSINATURA E TIPAGEM: 7 argumentos e BigDecimal
-                    future.complete(
+                    // Completa com erro para o chamador do método LEGADO
+                    legacyWhatIfFuture.complete(
                             new MarginWhatIfResponseDTO(
-                                    null,                       // 1. symbol
-                                    BigDecimal.ZERO,            // 2. quantity (Corrigido para BigDecimal)
-                                    BigDecimal.ZERO,            // 3. initialMarginChange
-                                    BigDecimal.ZERO,            // 4. maintenanceMarginChange
-                                    BigDecimal.ZERO,            // 5. commissionEstimate (Campo Novo)
-                                    null,                       // 6. currency (Campo Novo)
-                                    errorMsg                    // 7. error
+                                    null,                       // 1. symbol (String)
+                                    BigDecimal.ZERO,            // 2. quantity (BigDecimal)
+                                    BigDecimal.ZERO,            // 3. initialMarginChange (BigDecimal)
+                                    BigDecimal.ZERO,            // 4. maintenanceMarginChange (BigDecimal)
+                                    BigDecimal.ZERO,            // 5. commissionEstimate (BigDecimal)
+                                    "BRL",                      // 6. currency (String - Corrigido para o tipo String do record)
+                                    errorMsg                    // 7. error (String)
                             )
                     );
                 } else {
@@ -566,11 +679,14 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             log.info("✅ Conexão estabelecida com sucesso. Próximo ID de Ordem Válido: {}", orderId);
             orderIdManager.initializeOrUpdate(orderId);
             connectionLatch.countDown();
+
+            // 🚨 DISPARO CRÍTICO: Dispara a requisição de Margem Crítica após a conexão
+            requestCriticalMarginData();
+
         } catch (Exception e) {
             log.error("💥 [Ponte IBKR] Falha ao processar nextValidId {}. Rastreando.", orderId, e);
         }
     }
-
     // O método whatIfMargin foi removido para garantir a compilação, conforme a interface EWrapper fornecida.
 
     // --- Outros Callbacks EWrapper (Métodos obrigatórios ou de baixo tráfego) ---
@@ -650,50 +766,70 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
 
     @Override public void commissionAndFeesReport(CommissionAndFeesReport var1) {}
 
+    @Override
     public void accountSummary(int reqId, String account, String tag, String value, String currency) {
-        // Sempre especificar quando a ponte está sendo usada e quando é o principal.
         // Este método faz parte da **Ponte** (IBKRConnector/EWrapper).
         try {
             BigDecimal accountValue;
 
-            // 1. Tenta converter o valor da String 'value' para BigDecimal
+            // 1. Tenta converter o valor da String 'value' para BigDecimal// Tags como 'NetLiquidation' e 'MaintMarginReq' são Strings[cite: 335].
             try {
-                // A tag do NLV geralmente é NetLiquidationValue na Account Summary
-                // Remove vírgulas para garantir a correta conversão numérica
-                accountValue = new BigDecimal(value.replaceAll(",", ""));
+                // Limpa vírgulas (padrão TWS) e remove prefixos não numéricos antes de converter.
+                // Ex: '$326,440.38 USD' se torna '326440.38'
+                String cleanValue = value.replaceAll("[^0-9\\.\\-]+", "");
+
+                if (cleanValue.isEmpty() || cleanValue.equals("-")) {
+                    accountValue = BigDecimal.ZERO;
+                } else {
+                    accountValue = new BigDecimal(cleanValue);
+                }
+
             } catch (NumberFormatException e) {
-                // Captura exceção se o valor não for um número (ex: "N/A", "--")
-                log.debug("⚠️ Valor não numérico recebido na AccountSummary para tag '{}'. Ignorado. Valor original: {}", tag, value);
+                // Captura exceção se o valor não for um número (Ex: AccountType, que é string)
+                log.debug("⚠️ [PONTE | AccountSummary] Valor não numérico recebido para tag '{}'. Ignorado. Valor original: {}", tag, value);
                 return;
             }
 
-            // 2. 🛑 CORREÇÃO CRÍTICA: Se for NLV, chama o setter dedicado com a variável CORRETA.
+            // 2. 🛑 ENCAMINHAMENTO CRÍTICO (SSOT): Envia o valor (qualquer valor) para o cache da Ponte.
+            // Isto garante que MaintMarginReq, InitMarginReq, EquityWithLoanValue, etc.,
+            // sejam armazenados no LivePortfolioService para uso na validação de risco.
+            portfolioService.updateAccountValue(tag, accountValue);
+
+
+            // 3. LOGICÁ DE SOBRESCRITA/ALERTAS (Net Liquidation Value e Chaves Críticas)
+            // O NLV é importante para sobrescrever o valor interno e disparar a atualização de portfólio.
             if ("NetLiquidation".equalsIgnoreCase(tag) || "NetLiquidationValue".equalsIgnoreCase(tag)) {
-                log.debug("⬅️ [PONTE | SNAPSHOT NLV] Capturado NLV via Account Update. Enviando para setter dedicado. NLV: R$ {}", accountValue);
-                // Utilizando 'accountValue' que foi definida
+                log.info("⬅️ [PONTE | SUMMARY NLV] Capturado NLV. Enviando para setter dedicado: R$ {}", accountValue);
                 portfolioService.updateNetLiquidationValueFromCallback(accountValue);
+            } else if ("MaintMarginReq".equalsIgnoreCase(tag)) {
+                // Logs explicativos para acompanhamento do dado CRÍTICO (Obrigatório)
+                log.warn("🚨 [PONTE | MARGEM CRÍTICA] MaintMarginReq recebido: R$ {}. A validação de Excesso de Liquidez será disparada.", accountValue.toPlainString());
             }
 
-            // 3. Lógica original para o resto dos dados (Outras tags como TotalCashValue, EquityWithLoanValue, etc.)
-            // Manter a sinergia com a lógica de atualização geral.
-            portfolioService.updateAccountValue(tag, accountValue);
-            log.debug("📊 [PONTE | SNAPSHOT-IN] Account Summary Recebido: {} = R$ {}", tag, accountValue);
+            log.debug("📊 [PONTE | SNAPSHOT-IN] Account Summary Processado: {} = R$ {}", tag, accountValue.toPlainString());
 
         } catch (Exception e) {
-            // Garante o try-catch para rastrear o que acontece no código.
-            log.error("💥 [PONTE | SNAPSHOT] Erro inesperado ao processar Account Summary. Tag: {}", tag, e);
+            // Garante o try-catch para rastrear o que acontece no código [cite: 2025-10-18].
+            log.error("💥 [PONTE | SNAPSHOT] Erro inesperado ao processar Account Summary para Tag: {}", tag, e);
         }
     }
+
+
 
     @Override
     public void accountSummaryEnd(int reqId) {
         try {
-            log.info("✅ [PONTE | SNAPSHOT-END] Fim do Account Summary para reqId {}.", reqId);
+            // Verifica se este é o fim da requisição CRÍTICA
+            if (reqId == CRITICAL_MARGIN_REQ_ID) {
+                log.error("🎉🎉 [PONTE | MARGEM CRÍTICA CONCLUÍDA] Fim do Account Summary de Margem (ReqID: {}). Dados de risco populados.", reqId);
+            }
+            // Lógica legada ou de limpeza
             currentAccountSummaryReqId.compareAndSet(reqId, -1);
         } catch (Exception e) {
             log.error("💥 [Ponte IBKR] Falha ao processar accountSummaryEnd {}. Rastreando.", reqId, e);
         }
     }
+
     @Override public void execDetailsEnd(int i) {}
     @Override public void verifyMessageAPI(String s) {}
     @Override public void verifyCompleted(boolean b, String s) {}

@@ -1,16 +1,17 @@
-// File: src/main/java/com/example/homegaibkrponte/rest/IBKRController.java (Atualizado)
 package com.example.homegaibkrponte.rest;
 
 import com.example.homegaibkrponte.connector.IBKRConnector;
-import com.example.homegaibkrponte.dto.OrderDTO;
-import com.example.homegaibkrponte.dto.MarginWhatIfResponseDTO; // Importação do novo DTO
+import com.example.homegaibkrponte.connector.mapper.IBKRMapper;
+import com.example.homegaibkrponte.dto.*;
+import com.example.homegaibkrponte.model.OrderStateDTO;
 import com.example.homegaibkrponte.model.Position;
 import com.example.homegaibkrponte.model.PositionDTO;
 import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import com.example.homegaibkrponte.service.OrderIdManager;
 import com.example.homegaibkrponte.service.OrderService;
-import lombok.RequiredArgsConstructor;
+import com.ib.client.Contract;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -23,21 +24,44 @@ import java.util.stream.Collectors;
 /**
  * Controlador REST principal para interações com a ponte IBKR.
  * Centraliza todos os endpoints para status, ordens e informações da conta.
+ *
+ * Inclui correções de sinergia para:
+ * 1. Unificação do fluxo de What-If para usar apenas o método sendWhatIfRequest().
+ * 2. Gestão explícita da subscrição de Account Updates.
  */
 @RestController
 @RequestMapping("/api/ibkr")
-@RequiredArgsConstructor
 @Slf4j
 public class IBKRController {
 
+    // Dependências mantidas como final
     private final IBKRConnector connector;
     private final OrderService orderService;
     private final LivePortfolioService portfolioService;
+    private final IBKRMapper ibkrMapper;
     private final OrderIdManager orderIdManager;
+    // Campo duplicado mantido como final para compatibilidade com a implementação original
+    private final IBKRConnector ibkrConnector;
 
+    @Autowired
+    public IBKRController(IBKRConnector connector, OrderService orderService,
+                          LivePortfolioService portfolioService, IBKRMapper ibkrMapper,
+                          OrderIdManager orderIdManager) {
+        this.connector = connector;
+        this.orderService = orderService;
+        this.portfolioService = portfolioService;
+        this.ibkrConnector = connector; // ibkrConnector é o mesmo que connector
+        this.ibkrMapper = ibkrMapper;
+        this.orderIdManager = orderIdManager;
+    }
+
+    /**
+     * Endpoint de saúde e status da conexão com o TWS/Gateway.
+     */
     @GetMapping("/status")
     public ResponseEntity<String> getStatus() {
         if (!connector.isConnected()) {
+            // Tenta reconectar se estiver desconectado
             connector.connect();
         }
         return connector.isConnected()
@@ -47,7 +71,7 @@ public class IBKRController {
 
     /**
      * 🚨 NOVO ENDPOINT (SINERGIA): Força a sincronização completa dos valores de conta (BP, EL, NLV) do TWS.
-     * Necessário para resolver o problema de dados de margem desatualizados no Principal.
+     * Após a requisição, a subscrição é desativada imediatamente.
      */
     @GetMapping("/sync-account-values")
     public ResponseEntity<Void> syncAccountValues(@RequestParam String accountId) {
@@ -59,10 +83,13 @@ public class IBKRController {
         log.info("➡️ [Ponte | SYNC] Recebida requisição do Principal para sincronização forçada de valores de conta para {}", accountId);
 
         try {
-            // Dispara a subscrição de atualização de conta no TWS (que é assíncrona)
-            // Usamos reqAccountUpdates que dispara o callback updateAccountValue
+            // 1. Dispara a subscrição de atualização de conta no TWS (que é assíncrona)
             connector.getClient().reqAccountUpdates(true, accountId);
             log.warn("🔄 [Ponte | SYNC] Subscrição de Account Updates enviada ao TWS. Dados serão atualizados via callback.");
+
+            // 2. Desativa a subscrição para evitar tráfego contínuo desnecessário
+            connector.getClient().reqAccountUpdates(false, accountId);
+            log.info("✅ [Ponte | SYNC] Subscrição de Account Updates desativada.");
 
             // Retornamos OK imediatamente, pois a atualização é assíncrona.
             return ResponseEntity.ok().build();
@@ -74,56 +101,55 @@ public class IBKRController {
     }
 
     /**
-     * ✅ CORRIGIDO: Este método agora busca o poder de compra em tempo real a cada requisição.
+     * ✅ CORRIGIDO: Busca o poder de compra em tempo real, disparando um refresh assíncrono antes de retornar o cache.
      */
     @GetMapping("/buying-power")
-    public ResponseEntity<BigDecimal> getBuyingPower() {
+    public ResponseEntity<AccountLiquidityDTO> getBuyingPower() {
         log.info("------------------------------------------------------------");
         log.info("💰 Requisição REST recebida para '/buying-power' (em tempo real).");
 
         if (!connector.isConnected()) {
-            log.error("❌ Abortando: Conexão com a corretora não está ativa. Retornando ZERO.");
-            return ResponseEntity.ok(BigDecimal.ZERO);
+            log.error("❌ Abortando: Conexão com a corretora não está ativa. Retornando DTO com ZEROS.");
+            // Retorna um DTO com zeros para manter o contrato de serviço
+            return ResponseEntity.ok(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
         }
 
-        // PASSO 1: Captura o estado atual do Buying Power antes da requisição TWS
-        LivePortfolioService.AccountBalance initialSnapshot = portfolioService.getLastBuyingPowerSnapshot();
-        BigDecimal cachedBuyingPower = initialSnapshot.value();
-
         try {
-            portfolioService.resetAccountSyncLatch();
-
-            log.warn("⏳ Disparando 'reqAccountUpdates' e aguardando atualização de saldo em tempo real...");
+            // 1. Dispara a atualização de saldo na Ponte (Assíncrono, sem esperar o callback)
+            log.warn("⏳ Disparando 'reqAccountUpdates' (Assíncrono). Principal usará o valor mais fresco disponível.");
             connector.getClient().reqAccountUpdates(true, "All");
 
-            boolean syncCompleted = portfolioService.awaitInitialSync(15000);
-
+            // 2. Desativa a subscrição imediatamente após o disparo
             connector.getClient().reqAccountUpdates(false, "All");
 
-            if (!syncCompleted) {
-                // AJUSTE CRÍTICO: TIMEOUT. Usar o valor MAIS FRESCO disponível.
-                BigDecimal finalBuyingPower = portfolioService.getCurrentBuyingPower();
-                BigDecimal fallbackValue = (finalBuyingPower.compareTo(BigDecimal.ZERO) == 0 && cachedBuyingPower.compareTo(BigDecimal.ZERO) == 0)
-                        ? BigDecimal.ZERO : finalBuyingPower;
+            // 3. Retorna IMEDIATAMENTE o DTO COMPLETO de liquidez do cache local
+            AccountLiquidityDTO liquidityStatus = portfolioService.getFullLiquidityStatus();
 
-                log.error("❌ TIMEOUT (15s)! Sincronização falhou. Retornando valor de FALLBACK (R${}).", fallbackValue);
-                return ResponseEntity.ok(fallbackValue);
+            if (liquidityStatus.getCurrentBuyingPower().compareTo(BigDecimal.ZERO) <= 0) {
+                log.warn("⚠️ Retornando BP ZERO ou negativo no DTO. Principal deve usar Lógica de Fallback/ERRO.");
+            } else {
+                // Logs explicativos para rastrear o que está acontecendo (Obrigatório)
+                log.info("💸 Retornando DTO de Liquidez. NLV: R$ {}, Cash: R$ {}, BP: R$ {}",
+                        liquidityStatus.getNetLiquidationValue().toPlainString(),
+                        liquidityStatus.getCashBalance().toPlainString(),
+                        liquidityStatus.getCurrentBuyingPower().toPlainString());
             }
 
-            // Se SUCESSO, retorna o valor atualizado.
-            BigDecimal currentBuyingPower = portfolioService.getCurrentBuyingPower();
-            log.info("💸 Retornando o Poder de Compra sincronizado em tempo real: R$ {}", currentBuyingPower);
-            return ResponseEntity.ok(currentBuyingPower);
+            // Retorna o DTO estruturado
+            return ResponseEntity.ok(liquidityStatus);
 
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.error("❌ A thread foi interrompida enquanto esperava pela sincronização de saldo. Retornando ZERO.", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
+        } catch (Exception e) {
+            log.error("❌ ERRO INESPERADO ao processar requisição de Buying Power. Retornando ZEROS no DTO.", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
         } finally {
             log.info("------------------------------------------------------------");
         }
     }
 
+    /**
+     * Obtém todas as posições abertas. Utiliza um Latch para sincronizar a resposta assíncrona do TWS.
+     */
     @GetMapping("/positions")
     public ResponseEntity<List<PositionDTO>> getOpenPositions() {
         log.info("------------------------------------------------------------");
@@ -140,6 +166,7 @@ public class IBKRController {
             log.info("➡️  Solicitando posições à corretora e aguardando resposta...");
             connector.getClient().reqPositions();
 
+            // Espera até 60 segundos pela resposta do callback de posições
             boolean syncCompleted = portfolioService.awaitPositionSync(60000);
 
             if (!syncCompleted) {
@@ -147,7 +174,7 @@ public class IBKRController {
                 return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT).body(Collections.emptyList());
             }
 
-            // Quando a espera termina, o portfólio já está atualizado. Agora podemos ler.
+            // Lê o portfólio atualizado do cache local
             List<PositionDTO> openPositions = portfolioService.getLivePortfolioSnapshot()
                     .openPositions()
                     .values()
@@ -169,7 +196,7 @@ public class IBKRController {
 
     /**
      * ✅ CORREÇÃO FINAL DE SINERGIA: Endpoint chamado pelo Principal para forçar o Snapshot de Conta (EL/BP).
-     * Resolve o problema do Resgate e a discrepância de Liquidez.
+     * Dispara o requestAccountSummarySnapshot que atualiza o cache interno da Ponte.
      */
     @PostMapping("/sync-snapshot")
     public ResponseEntity<Void> triggerAccountSummarySnapshot() {
@@ -177,7 +204,6 @@ public class IBKRController {
         try {
             log.info("🔄 [Ponte | SYNC COMANDO] Recebido comando do Principal para forçar o Account Summary Snapshot.");
 
-            // ✅ CORREÇÃO: Chama o método existente no IBKRConnector
             connector.requestAccountSummarySnapshot();
 
             log.info("✅ [Ponte | SYNC] Snapshot de Account Summary disparado no TWS. Dados serão atualizados assincronamente.");
@@ -200,6 +226,9 @@ public class IBKRController {
         return dto;
     }
 
+    /**
+     * Submete uma nova ordem ao TWS/Gateway.
+     */
     @PostMapping("/place-order")
     public ResponseEntity<OrderDTO> placeOrder(@RequestBody OrderDTO orderDto) {
         // Log de Entrada - Indica o início do processamento da ordem na Ponte
@@ -229,6 +258,9 @@ public class IBKRController {
         }
     }
 
+    /**
+     * Fornece o próximo ID de ordem válido para ser usado pelo Principal.
+     */
     @GetMapping("/order/next-id")
     public ResponseEntity<NextOrderIdResponse> getNextOrderId() {
         try {
@@ -244,16 +276,17 @@ public class IBKRController {
     // Classe interna para a resposta do ID da ordem
     private record NextOrderIdResponse(int nextOrderId) {}
 
+    /**
+     * Obtém o Net Liquidation Value (PL) do cache da Ponte.
+     */
     @GetMapping("/margin/nlv")
     public ResponseEntity<BigDecimal> getNetLiquidationValue() {
-        // Aplica try-catch e logs explicativos (Obrigatório)
         try {
-            // Assume-se que o NLV do dia anterior pode ser espelhado pelo NLV mais fresco,
-            // que é armazenado no cache da Ponte durante a sincronização.
+            // NLV é espelhado pelo valor mais fresco no cache.
             BigDecimal netLiquidation = portfolioService.getNetLiquidationValue();
 
             if (netLiquidation.compareTo(BigDecimal.ZERO) <= 0) {
-                log.warn("⚠️ [Ponte | NLV] Net Liquidation Value (NLV) retornou R$ 0.00. Assumindo que o dado é do dia anterior, mas está indisponível/zerado. Veto de Sizing possível no Principal.");
+                log.warn("⚠️ [Ponte | NLV] Net Liquidation Value (NLV) retornou R$ 0.00 ou negativo. Assumindo indisponibilidade. Veto de Sizing possível no Principal.");
             }
 
             log.info("✅ [Ponte | NLV] Retornando Net Liquidation Value (PL) para o Principal: R$ {}", netLiquidation);
@@ -261,73 +294,100 @@ public class IBKRController {
 
         } catch (Exception e) {
             log.error("❌ [Ponte | ERRO NLV] Falha crítica ao obter Net Liquidation Value (PL). Forçando R$ 0.00. Rastreando.", e);
-            // Retorna ZERO, forçando o veto no Sizing do Principal (Fail-safe, mais seguro que um valor incorreto).
+            // Retorna ZERO, forçando o veto no Sizing do Principal (Fail-safe).
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
         }
     }
 
-
-
-
+    /**
+     * ✅ MÉTODO ATUAL E CORRIGIDO: Processa a simulação What-If (POST /margin/what-if)
+     * e utiliza o fluxo real assíncrono (sendWhatIfRequest) com espera síncrona.
+     * Este endpoint unifica e substitui os fluxos anteriores.
+     */
     @PostMapping("/margin/what-if")
-    public ResponseEntity<MarginWhatIfResponseDTO> requestMarginWhatIf(@RequestBody MarginWhatIfRequest request) {
-        log.info("➡️ [Ponte | Controller] Recebida requisição REST de What-If para {} (Qty: {}).", request.symbol(), request.quantity());
+    public ResponseEntity<WhatIfResponseDTO> processRealTimeWhatIf(@RequestBody WhatIfRequestDTO request) {
 
-        // Conversão obrigatória para o DTO de resposta (alinha com a sinergia de tipos)
-        BigDecimal requestQuantityBd = new BigDecimal(request.quantity());
+        log.info("➡️ [Ponte | Controller] Recebida requisição REST What-If REAL para {} (Lado: {}, Qty: {}).",
+                request.getSymbol(), request.getSide(), request.getQuantity());
 
+        // Inicializa o Buying Power. Será usado em caso de falha.
+        BigDecimal realTimeBuyingPower = BigDecimal.ZERO;
+
+        // 1. Garante que a conexão está ativa antes de prosseguir
         if (!connector.isConnected()) {
             log.error("❌ [Ponte | What-If] Conexão com TWS inativa. Retornando erro de serviço indisponível.");
-            // Linha 285 (Exemplo): Construtor DTO com 7 argumentos e BigDecimal
-            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(
-                    new MarginWhatIfResponseDTO(
-                            request.symbol(),
-                            requestQuantityBd, // ✅ Tipo BigDecimal
-                            BigDecimal.ZERO,
-                            BigDecimal.ZERO,
-                            BigDecimal.ZERO, // commissionEstimate
-                            null,            // currency
-                            "Conexão com a corretora indisponível."
-                    )
-            );
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(new WhatIfResponseDTO(
+                    false,
+                    BigDecimal.ZERO,
+                    realTimeBuyingPower,
+                    "Conexão com a corretora indisponível."
+            ));
         }
+
+        // 🚨 NOVO: Obtém o ID de ordem de forma ATÔMICA para What-If (Corrige TWS Code 103 - Duplicar ID)
+        int whatIfOrderId = orderIdManager.getNextOrderId();
+        log.info("ℹ️ [Ponte | What-If] Utilizando Novo ID de Ordem: {}", whatIfOrderId);
 
         try {
-            // ✅ CHAMADA À PONTE (Bridge)
-            // A assinatura do request.quantity() aqui deve ser compatível com o connector.requestMarginWhatIf(String, int)
-            // Se o request.quantity() for int, passe-o; se for BigDecimal, ajuste o método do connector.
-            MarginWhatIfResponseDTO response = connector.requestMarginWhatIf(request.symbol(), request.quantity());
+            Contract contract = ibkrMapper.toContract(request.getSymbol());
+            // Cria a Ordem What-If a partir do DTO (o Mapper ou Connector deve garantir transmit(true))
+            com.ib.client.Order order = ibkrMapper.toWhatIfOrder(whatIfOrderId, request.getSide(), request.getQuantity());
 
-            // Log de retorno
-            if (response.error() != null && !response.error().isEmpty()) {
-                log.warn("⚠️ [Ponte | What-If] Simulação What-If para {} retornou erro do TWS: {}", request.symbol(), response.error());
-            } else {
-                log.info("✅ [Ponte | What-If] Simulação What-If para {} retornou sucesso. Mudança Margem Inicial: R$ {}",
-                        request.symbol(), response.initialMarginChange());
+            // 1. Executa a simulação REAL
+            OrderStateDTO resultState = ibkrConnector.sendWhatIfRequest(contract, order);
+
+            // 2. Mapeamento do valor REAL da Mudança de Margem
+            BigDecimal marginChange = ibkrMapper.parseMarginValue(resultState.getInitMarginChange());
+
+            // 🚨 NOVO (Regra [2025-11-03]): Obtém o Buying Power mais fresco
+            // O portfolioService gerencia o cache e tem o valor mais atualizado da Ponte.
+            realTimeBuyingPower = portfolioService.getFullLiquidityStatus().getCurrentBuyingPower();
+
+            // Logs explicativos para acompanhamento
+            log.info("📢 [CONTROLLER | SUCESSO] What-If concluído. Mudança de Margem (R$ {}), Liquidez Atual (R$ {}).",
+                    marginChange, realTimeBuyingPower);
+
+            return ResponseEntity.ok(new WhatIfResponseDTO(
+                    true,
+                    marginChange,
+                    realTimeBuyingPower,
+                    null
+            ));
+
+        } catch (UnsupportedOperationException e) {
+            log.error("🛑 [CONTROLLER | What-If REJEITADO] Fluxo de What-If indisponível ou falha interna: {}", e.getMessage());
+            // Tenta obter o BP para inclusão na resposta
+            try {
+                realTimeBuyingPower = portfolioService.getFullLiquidityStatus().getCurrentBuyingPower();
+            } catch (Exception ignored) { /* Ignora se falhar */ }
+
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(new WhatIfResponseDTO(
+                    false,
+                    BigDecimal.ZERO,
+                    realTimeBuyingPower,
+                    "Serviço de What-If inativo ou falha de dependência."
+            ));
+        }
+        catch (RuntimeException e) {
+            // Captura falha do .join() ou TWS Error (e.g., Code 103, 321)
+
+            // Tenta obter o BP para a resposta de erro (Regra [2025-11-03])
+            try {
+                realTimeBuyingPower = portfolioService.getFullLiquidityStatus().getCurrentBuyingPower();
+            } catch (Exception ignored) {
+                log.warn("⚠️ [CONTROLLER | What-If] Falha ao obter Buying Power no catch. Retornando ZERO.");
             }
 
-            return ResponseEntity.ok(response);
+            log.error("🛑 [CONTROLLER | What-If REJEITADO] Falha ao processar simulação What-If para {}. Motivo: {}",
+                    request.getSymbol(), e.getMessage());
 
-        } catch (Exception e) {
-            log.error("❌ [Ponte | ERRO What-If] Falha CRÍTICA ao processar What-If para {}. Rastreando.", request.symbol(), e);
-            // Linha 322 (Exemplo): Construtor DTO com 7 argumentos e BigDecimal
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
-                    new MarginWhatIfResponseDTO(
-                            request.symbol(),
-                            requestQuantityBd, // ✅ Tipo BigDecimal
-                            BigDecimal.ZERO,
-                            BigDecimal.ZERO,
-                            BigDecimal.ZERO, // commissionEstimate
-                            null,            // currency
-                            "Erro interno da Ponte ao executar What-If: " + e.getMessage()
-                    )
-            );
+            // Retorna o Buying Power conhecido, mesmo que a simulação falhe.
+            return ResponseEntity.ok(new WhatIfResponseDTO(
+                    false,
+                    BigDecimal.ZERO,
+                    realTimeBuyingPower,
+                    "Simulação de margem falhou: " + e.getMessage()
+            ));
         }
     }
-
-
-
-
-    // Classe interna para mapear a requisição de What-If (Obrigatório: Records para DTOs)
-    private record MarginWhatIfRequest(String symbol, int quantity) {}
 }

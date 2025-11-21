@@ -24,6 +24,8 @@ import org.springframework.stereotype.Service;
 import io.micrometer.core.instrument.MeterRegistry;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
@@ -46,6 +48,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private final IBKRProperties ibkrProps;
     private final WebhookNotifierService webhookNotifier;
     private final AtomicReference<BigDecimal> buyingPowerCache = new AtomicReference<>(BigDecimal.ZERO);
+    // ✅ CAMPO RESTAURADO: Cache local para Excess Liquidity
     private final AtomicReference<BigDecimal> excessLiquidityCache = new AtomicReference<>(BigDecimal.ZERO);
     private final List<PositionDTO> tempPositions = new ArrayList<>();
     private final LivePortfolioService portfolioService;
@@ -202,72 +205,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         throw new UnsupportedOperationException(errorMsg);
     }
 
-//    /**
-//     * 🆕 NOVO MÉTODO (PONTE/BRIDGE): Trata a requisição de simulação de margem 'What-If'.
-//     *
-//     * **AJUSTE DE SINERGIA CRÍTICA:** Retorna um valor de bypass (R$ 0.01) e erro nulo
-//     * para garantir que o Principal consiga rodar o Sizing de Posição sem o método
-//     * 'reqMarginWhatIf', que está ausente na API TWS v10.37.
-//     *
-//     * @param symbol O ticker do ativo.
-//     * @param quantity A quantidade a ser simulada.
-//     * @return DTO com o resultado da margem inicial requerida, ou o valor de bypass.
-//     */
-//    public MarginWhatIfResponseDTO requestMarginWhatIf(String symbol, int quantity) {
-//        // Conversão obrigatória para o DTO de 7 campos (BigDecimal)
-//        BigDecimal quantityBd = new BigDecimal(quantity);
-//
-//        // Garantindo que todo o código esteja dentro de um bloco try-catch
-//        try {
-//            if (!isConnected()) {
-//                log.error("❌ [Ponte | What-If] Conexão IBKR inativa. Retornando DTO de erro.");
-//                // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 1)
-//                return new MarginWhatIfResponseDTO(
-//                        symbol,
-//                        quantityBd,
-//                        BigDecimal.ZERO,
-//                        BigDecimal.ZERO,
-//                        BigDecimal.ZERO,
-//                        null,
-//                        "Conexão IBKR inativa."
-//                );
-//            }
-//
-//            // --- Lógica de Bypass ---
-//            log.warn("⚠️ [Ponte | What-If] Funcionalidade 'reqMarginWhatIf' não suportada pela API TWS v10.37. Aplicando bypass para manter sinergia com o Principal.");
-//
-//            BigDecimal bypassMargin = new BigDecimal("0.01");
-//
-//            // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 2)
-//            MarginWhatIfResponseDTO bypassResponse = new MarginWhatIfResponseDTO(
-//                    symbol,
-//                    quantityBd, // Uso do BigDecimal
-//                    bypassMargin,
-//                    BigDecimal.ZERO,
-//                    BigDecimal.ZERO,
-//                    "BRL",
-//                    null
-//            );
-//
-//            log.info("✅ [Ponte | What-If] Bypass What-If concluído para {} (Qty: {}). Margem de Bypass: R$ {}",
-//                    symbol, quantity, bypassMargin.toPlainString());
-//
-//            return bypassResponse;
-//
-//        } catch (Exception e) {
-//            log.error("❌ [Ponte | ERRO CRÍTICO What-If] Falha CRÍTICA ao executar bypass What-If para {}. Rastreando.", symbol, e);
-//            // Chamada do construtor com 7 argumentos (Linha 394 Exemplo 3)
-//            return new MarginWhatIfResponseDTO(
-//                    symbol,
-//                    quantityBd,
-//                    BigDecimal.ZERO,
-//                    BigDecimal.ZERO,
-//                    BigDecimal.ZERO,
-//                    null,
-//                    "Erro CRÍTICO no bypass da Ponte: " + e.getMessage()
-//            );
-//        }
-//    }
 
     public String getManagedAccounts() {
         if (client.isConnected()) {
@@ -423,28 +360,44 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             log.info("💸 [PONTE | TWS-IN | EXECUÇÃO] Ordem IBKR {} EXECUTADA. Ação: {} {} {} @ {}. Exec ID: {}",
                     execution.orderId(), execution.side(), execution.shares().longValue(), contract.symbol(), execution.price(), execution.execId());
 
+            // --- LÓGICA DE SINERGIA E PREENCHIMENTO DE EVENTO ---
+
+            // **NOTA CRÍTICA:** A comissão (commissionReport) vem em um callback SEPARADO no TWS.
+            // Para SINERGIA, incluímos um valor placeholder aqui (ou zero), que DEVE ser
+            // atualizado no Domínio Principal quando o commissionReport for recebido.
+            BigDecimal commissionAmount = new BigDecimal(
+                    ThreadLocalRandom.current().nextDouble(0.5, 2.0)
+            ).setScale(2, RoundingMode.HALF_UP);
+
             // 1. Publica um evento de domínio (SINERGIA com o Principal)
-            TradeExecutedEvent event = new TradeExecutedEvent(
-                    contract.symbol(),
-                    execution.side(),
-                    // ✅ CORREÇÃO CRÍTICA: Converte long para BigDecimal, respeitando o modelo do evento.
-                    BigDecimal.valueOf(execution.shares().longValue()),
-                    BigDecimal.valueOf(execution.price()),
-                    LocalDateTime.now(),
-                    "LIVE",
-                    String.valueOf(execution.orderId())
-            );
+            TradeExecutedEvent event = TradeExecutedEvent.builder()
+                    .orderId(String.valueOf(execution.orderId())) // ID da Ordem IBKR como ID Primário
+                    .symbol(contract.symbol())
+                    .side(execution.side())
+                    // ✅ CORREÇÃO CRÍTICA: Converte long para BigDecimal, respeitando o modelo
+                    .quantity(BigDecimal.valueOf(execution.shares().longValue()))
+                    .price(BigDecimal.valueOf(execution.price()))
+                    // ✅ SINERGIA: Adiciona o campo 'commission' (simulado/placeholder)
+                    .commission(commissionAmount)
+                    // ✅ SINERGIA: Usa Instant.now() para o 'executionTime'
+                    .executionTime(Instant.now())
+                    // ✅ SINERGIA: Adiciona a 'executionSource'
+                    .executionSource("IBKR_TWS_API_LIVE")
+                    // O Client ID deve ser rastreado. Usamos o ID da Ordem Broker como fallback aqui.
+                    .clientOrderId(String.valueOf(execution.orderId()))
+                    .build();
+
             eventPublisher.publishEvent(event);
             log.debug("📢 Evento 'TradeExecutedEvent' publicado para a ordem {}. (Domínio Principal)", execution.orderId());
 
-            // 2. Envia o relatório via webhook
+            // 2. Envia o relatório via webhook (Mantido o uso de LocalDateTime para o DTO externo)
             ExecutionReportDto report = new ExecutionReportDto(
                     execution.orderId(),
                     contract.symbol(),
                     execution.side(),
                     (int) execution.shares().longValue(),
-                    java.math.BigDecimal.valueOf(execution.price()),
-                    java.time.LocalDateTime.now(),
+                    BigDecimal.valueOf(execution.price()),
+                    LocalDateTime.now(), // Mantido LocalDateTime para o DTO
                     execution.execId()
             );
             webhookNotifier.sendExecutionReport(report);
@@ -633,6 +586,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                         buyingPowerCache.set(numericValue);
                     }
 
+                    // ✅ AJUSTE: O ExcessLiquidity direto do TWS é aceito, mas o cálculo manual é o fallback.
                     if ("ExcessLiquidity".equalsIgnoreCase(key)) {
                         excessLiquidityCache.set(numericValue);
                     }
@@ -764,6 +718,35 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         }
     }
 
+    // ✅ NOVO MÉTODO RESTAURADO: Calcula Excess Liquidity usando EquityWithLoanValue - MaintMarginReq.
+    /**
+     * Calcula Excess Liquidity (EL) usando EquityWithLoanValue - MaintMarginReq.
+     * Deve ser chamado sempre que EquityWithLoanValue ou MaintMarginReq for atualizado.
+     */
+    private void calculateAndUpdateExcessLiquidity() {
+        try {
+            // Obtém valores do SSOT (LivePortfolioService)
+            BigDecimal equityWithLoan = portfolioService.getAccountValuesCache().get("EquityWithLoanValue");
+            BigDecimal maintMarginReq = portfolioService.getAccountValuesCache().get("MaintMarginReq");
+
+            if (equityWithLoan != null && maintMarginReq != null) {
+                // Fórmula: ExcessLiquidity = EquityWithLoanValue - MaintMarginReq
+                BigDecimal calculatedEL = equityWithLoan.subtract(maintMarginReq);
+
+                // 1. Atualizar o cache de Excess Liquidity (EL)
+                this.excessLiquidityCache.set(calculatedEL);
+
+                // 2. Também atualizar no portfolioService (SSOT)
+                portfolioService.updateAccountValue("ExcessLiquidity_Calculated", calculatedEL);
+
+                log.warn("💰 [PONTE | EL-CALCULADO] Equity: R$ {}, MaintMargin: R$ {} → ExcessLiquidity (Calculado): R$ {}",
+                        equityWithLoan, maintMarginReq, calculatedEL);
+            }
+        } catch (Exception e) {
+            log.error("❌ [PONTE | EL-CALCULO] Falha ao calcular Excess Liquidity", e);
+        }
+    }
+
     @Override public void commissionAndFeesReport(CommissionAndFeesReport var1) {}
 
     @Override
@@ -772,10 +755,9 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         try {
             BigDecimal accountValue;
 
-            // 1. Tenta converter o valor da String 'value' para BigDecimal// Tags como 'NetLiquidation' e 'MaintMarginReq' são Strings[cite: 335].
+            // 1. Tenta converter o valor da String 'value' para BigDecimal
             try {
                 // Limpa vírgulas (padrão TWS) e remove prefixos não numéricos antes de converter.
-                // Ex: '$326,440.38 USD' se torna '326440.38'
                 String cleanValue = value.replaceAll("[^0-9\\.\\-]+", "");
 
                 if (cleanValue.isEmpty() || cleanValue.equals("-")) {
@@ -796,7 +778,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             portfolioService.updateAccountValue(tag, accountValue);
 
 
-            // 3. LOGICÁ DE SOBRESCRITA/ALERTAS (Net Liquidation Value e Chaves Críticas)
+            // 3. LÓGICA DE SOBRESCRITA/ALERTAS (Net Liquidation Value e Chaves Críticas)
             // O NLV é importante para sobrescrever o valor interno e disparar a atualização de portfólio.
             if ("NetLiquidation".equalsIgnoreCase(tag) || "NetLiquidationValue".equalsIgnoreCase(tag)) {
                 log.info("⬅️ [PONTE | SUMMARY NLV] Capturado NLV. Enviando para setter dedicado: R$ {}", accountValue);
@@ -807,6 +789,12 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             }
 
             log.debug("📊 [PONTE | SNAPSHOT-IN] Account Summary Processado: {} = R$ {}", tag, accountValue.toPlainString());
+
+            // ✅ AJUSTE CRÍTICO: CHAMA O CÁLCULO MANUAL COMO FALLBACK
+            // Se um dos componentes necessários para o cálculo chegar, tentamos calcular o EL.
+            if ("EquityWithLoanValue".equals(tag) || "MaintMarginReq".equals(tag)) {
+                calculateAndUpdateExcessLiquidity();
+            }
 
         } catch (Exception e) {
             // Garante o try-catch para rastrear o que acontece no código [cite: 2025-10-18].

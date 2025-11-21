@@ -13,6 +13,10 @@ import reactor.util.retry.Retry;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.time.LocalDateTime; // NOVO IMPORT NECESSÁRIO
+import java.util.HashMap; // NOVO IMPORT NECESSÁRIO
+import java.util.Map; // NOVO IMPORT NECESSÁRIO
+
 
 /**
  * SERVIÇO NA PONTE IBKR (BRIDGE)
@@ -27,11 +31,13 @@ public class WebhookNotifierService {
     private final WebClient webClient;
 
     // 🚨 AJUSTE CRÍTICO DE SINERGIA: UNIFICANDO OS URIS PARA O WEBHOOK DINÂMICO NO PRINCIPAL
-    // O Principal (WebhookController) só escuta em /webhook/execution-status
     private static final String EXECUTION_STATUS_URI = "/webhook/execution-status";
 
     // O Market Tick é um evento separado e precisa ser tratado em um endpoint dedicado
-    private static final String MARKET_TICK_URI = "/api/v1/callbacks/ibkr/market-tick"; // Mantido, assumindo que há um Controller separado para ticks
+    private static final String MARKET_TICK_URI = "/api/v1/callbacks/ibkr/market-tick";
+
+    // ✅ NOVO URI: Para notificações de Liquidez/Saúde
+    private static final String LIQUIDITY_ALERT_URI = "/webhook/alert/liquidity";
 
     // Política de Retentativa: 3 tentativas, com backoff exponencial a partir de 2 segundos.
     private final Retry retrySpec = Retry.backoff(3, Duration.ofSeconds(2))
@@ -66,7 +72,7 @@ public class WebhookNotifierService {
         log.info("▶️ [WEBHOOK-OUT] Enviando notificação de execução para o Principal. Ordem: {} -> URL: {}", report.getOrderId(), EXECUTION_STATUS_URI);
 
         this.webClient.post()
-                .uri(EXECUTION_STATUS_URI) // ✅ AJUSTE AQUI
+                .uri(EXECUTION_STATUS_URI)
                 .bodyValue(report)
                 .retrieve()
                 .onStatus(HttpStatusCode::isError, clientResponse ->
@@ -102,7 +108,7 @@ public class WebhookNotifierService {
                 orderId, errorCode, EXECUTION_STATUS_URI);
 
         this.webClient.post()
-                .uri(EXECUTION_STATUS_URI) // ✅ AJUSTE AQUI
+                .uri(EXECUTION_STATUS_URI)
                 .bodyValue(rejection)
                 .retrieve()
                 .onStatus(HttpStatusCode::isError, clientResponse ->
@@ -143,6 +149,50 @@ public class WebhookNotifierService {
                 .subscribe(
                         response -> log.trace("✅ [WEBHOOK-OUT] Market Tick para {} confirmado (Status: {}).", symbol, response.getStatusCode()),
                         error -> log.warn("❌ Falha temporária ao enviar Market Tick para {}: {}", symbol, error.getMessage())
+                );
+    }
+
+    // =========================================================================
+    // ✅ NOVOS MÉTODOS PARA NOTIFICAÇÃO DE LIQUIDEZ (FIXANDO SINERGIA)
+    // =========================================================================
+
+    /**
+     * Envia uma notificação crítica de liquidez ao Principal (usada por LiquidityMonitorService).
+     */
+    public void notifyCriticalLiquidity(String message) {
+        sendLiquidityAlert("CRITICAL", message);
+    }
+
+    /**
+     * Envia uma notificação de warning/alerta de liquidez ao Principal.
+     */
+    public void notifyWarningLiquidity(String message) {
+        sendLiquidityAlert("WARNING", message);
+    }
+
+    private void sendLiquidityAlert(String level, String message) {
+        Map<String, Object> alert = new HashMap<>();
+        alert.put("level", level);
+        alert.put("message", message);
+        alert.put("timestamp", LocalDateTime.now());
+
+        log.warn("🚨 [WEBHOOK-OUT] Enviando alerta de liquidez {} -> URL: {}", level, LIQUIDITY_ALERT_URI);
+
+        // Política de Retry mais leve, pois é um alerta, não uma execução transacional
+        Retry alertRetrySpec = Retry.backoff(2, Duration.ofSeconds(1));
+
+        this.webClient.post()
+                .uri(LIQUIDITY_ALERT_URI)
+                .bodyValue(alert)
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, clientResponse ->
+                        Mono.error(new RuntimeException("Principal retornou erro HTTP: " + clientResponse.statusCode()))
+                )
+                .toBodilessEntity()
+                .retryWhen(alertRetrySpec)
+                .subscribe(
+                        response -> log.info("✅ [WEBHOOK-OUT] Alerta de liquidez {} confirmado.", level),
+                        error -> log.error("❌ [WEBHOOK-OUT] Falha ao notificar alerta de liquidez {}. Causa: {}", level, error.getMessage())
                 );
     }
 }

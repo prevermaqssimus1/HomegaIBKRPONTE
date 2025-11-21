@@ -110,8 +110,8 @@ public class IBKRController {
 
         if (!connector.isConnected()) {
             log.error("❌ Abortando: Conexão com a corretora não está ativa. Retornando DTO com ZEROS.");
-            // Retorna um DTO com zeros para manter o contrato de serviço
-            return ResponseEntity.ok(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
+            // RETORNO CORRIGIDO: 4 Argumentos (NLV, Cash, BP, EL)
+            return ResponseEntity.ok(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
         }
 
         try {
@@ -141,7 +141,8 @@ public class IBKRController {
         } catch (Exception e) {
             log.error("❌ ERRO INESPERADO ao processar requisição de Buying Power. Retornando ZEROS no DTO.", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
+                    // RETORNO CORRIGIDO NO CATCH: 4 Argumentos
+                    .body(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
         } finally {
             log.info("------------------------------------------------------------");
         }
@@ -296,6 +297,18 @@ public class IBKRController {
             log.error("❌ [Ponte | ERRO NLV] Falha crítica ao obter Net Liquidation Value (PL). Forçando R$ 0.00. Rastreando.", e);
             // Retorna ZERO, forçando o veto no Sizing do Principal (Fail-safe).
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
+        }
+    }
+
+    @GetMapping("/account/state")
+    public AccountStateDTO getFullAccountState(@RequestParam String accountId) {
+        try {
+            // Delega para o LivePortfolioService (Ponte) compilar e retornar o estado completo
+            return portfolioService.getFullAccountState(accountId);
+        } catch (Exception e) {
+            log.error("❌ Erro CRÍTICO ao processar requisição de AccountState para {}. Rastreando.", accountId, e);
+            // Retorna um DTO de falha seguro para o Principal
+            return AccountStateDTO.builder().build();
         }
     }
 

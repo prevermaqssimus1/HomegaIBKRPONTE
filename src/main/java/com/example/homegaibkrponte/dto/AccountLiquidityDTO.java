@@ -28,5 +28,9 @@ public class AccountLiquidityDTO {
     @JsonProperty("currentBuyingPower")
     private BigDecimal currentBuyingPower;
 
+    @JsonProperty("excessLiquidity")
+    private BigDecimal excessLiquidity;
+
+
     // * Adicione outros getters se necessário *
 }

@@ -4,6 +4,7 @@ import com.example.homegaibkrponte.connector.IBKRConnector;
 import com.example.homegaibkrponte.dto.OrderDTO;
 import com.example.homegaibkrponte.factory.ContractFactory;
 import com.example.homegaibkrponte.factory.OrderFactory;
+import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import com.ib.client.Contract;
 import com.ib.client.Order;
 import com.ib.client.Types;
@@ -11,6 +12,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -24,6 +26,7 @@ public class OrderService {
     private final OrderIdManager orderIdManager;
     private final ContractFactory contractFactory;
     private final OrderFactory orderFactory;
+    private final LivePortfolioService portfolioService;
 
     /**
      * Ponto de entrada para receber ordens via REST.
@@ -34,14 +37,21 @@ public class OrderService {
             throw new IllegalStateException("Não é possível enviar ordem: Desconectado do TWS/Gateway.");
         }
 
+        // 🚨 VETO DE LIQUIDEZ DE ALTO NÍVEL (Novo Veto Central)
+        if (!isExcessLiquiditySufficient()) {
+            BigDecimal el = portfolioService.getExcessLiquidity();
+            log.error("❌ [Ponte | ORDER-SERVICE | VETO] Ordem {} REJEITADA. Excess Liquidity (R$ {}) insuficiente para qualquer nova ordem.",
+                    orderDto.clientOrderId(), el.toPlainString());
+            throw new IllegalStateException("Ação vetada: Excess Liquidity zerado ou negativo. Sistema em Modo de Resgate.");
+        }
+
         // Log de Entrada (SINERGIA: Usando rationale para o 'SINAL' do Domínio Principal)
-        // O campo 'rationale' (Justificativa) geralmente carrega a estratégia (ex: LIMIT_STRATEGY_SIGNAL)
-        // Usamos orderDto.type() para o Tipo de Ordem IBKR (LMT, MKT)
+        // ... (resto do código do placeOrder)
         log.info("⚙️ [Ponte | ORDER-SERVICE] Recebendo ordem {}. Ativo: {}, SINAL: {}, Tipo IBKR: {}.",
                 orderDto.clientOrderId(),
                 orderDto.symbol(),
                 orderDto.rationale(), // <--- USANDO RATIONALE/SINAL PARA RASTREAMENTO
-                orderDto.type());     // <--- USANDO TYPE PARA TIPO DE ORDEM IBKR
+                orderDto.type());
 
         try {
             if (orderDto.isBracketOrder()) {
@@ -64,6 +74,13 @@ public class OrderService {
                     orderDto.clientOrderId(), orderDto.symbol(), e);
             throw new RuntimeException("Falha ao processar a ordem na Ponte: " + e.getMessage(), e);
         }
+    }
+
+    private boolean isExcessLiquiditySufficient() {
+        // Obtém o valor real de Excess Liquidity do cache SSOT
+        BigDecimal excessLiquidity = portfolioService.getExcessLiquidity(); // Obtido de LivePortfolioService
+        // Considera suficiente apenas se for estritamente positivo.
+        return excessLiquidity.compareTo(BigDecimal.ZERO) > 0;
     }
     // --- LÓGICA ATÔMICA BRACKET ORDER (Fase 9) ---
 

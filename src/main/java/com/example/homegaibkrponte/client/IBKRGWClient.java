@@ -1,9 +1,13 @@
 package com.example.homegaibkrponte.client;
 
 import com.example.homegaibkrponte.model.OrderExecutionResult;
+import com.example.homegaibkrponte.monitoring.LivePortfolioService; // 1. NOVO IMPORT
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.math.BigDecimal; // NOVO IMPORT
+import lombok.RequiredArgsConstructor; // NOVO IMPORT
 
 /**
  * CLASSE DA PONTE (Bridge): Cliente de Comunicação com o Gateway da IBKR.
@@ -12,13 +16,16 @@ import org.slf4j.LoggerFactory;
  * Implementa o Princípio da Responsabilidade Única (SRP - SOLID).
  */
 @Service
+@RequiredArgsConstructor // Usado para injetar dependências no construtor
 public class IBKRGWClient {
 
     private static final Logger log = LoggerFactory.getLogger(IBKRGWClient.class);
-
     // Variável para garantir a lógica de serialização e controle de concorrência (Fila de Order)
     private final Object orderQueueLock = new Object();
     private long nextOrderId = 1;
+
+    // 1. INJEÇÃO DO SERVIÇO SSOT (LivePortfolioService)
+    private final LivePortfolioService portfolioService;
 
     // ====================================================================
     // 1. MÉTODO DE VENDA (SAÍDA)
@@ -29,27 +36,31 @@ public class IBKRGWClient {
         synchronized (orderQueueLock) {
             log.info("📢 [PONTE IBKR | FILA] Ordem de VENDA {} para {} (Qtd: {}) ENQUEUE. ID Interno: {}",
                     action, symbol, quantity, nextOrderId);
-
             // TRY-CATCH para rastrear o que acontece no código
             try {
-                // VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE LIQUIDEZ
+                // VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE QUANTIDADE
                 if (quantity <= 0) {
                     log.error("❌ [PONTE IBKR | ERRO DIMENSIONAL] Ordem rejeitada: Quantidade ({}) é inválida. A Ponte CANCELA para não prejudicar o que já existe.", quantity);
                     return new OrderExecutionResult(false, "Quantidade dimensional inválida (zero ou negativa).");
                 }
 
+                // 🚨 2. VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE LIQUIDEZ (Excess Liquidity)
+                if (!isExcessLiquiditySufficient()) {
+                    log.error("❌ [PONTE IBKR | ERRO LIQUIDEZ] Ordem rejeitada: Excess Liquidity (R$ {}) insuficiente para a operação. Modo de Resgate pode estar ativo.",
+                            portfolioService.getExcessLiquidity().toPlainString());
+                    // 🛑 Retorna falha para forçar o tratamento no Principal (Modo de Resgate)
+                    return new OrderExecutionResult(false, "Excess Liquidity insuficiente. Ação vetada pela Ponte.");
+                }
+
                 // Simulação do envio real da ordem via socket ou API IBKR
                 Thread.sleep(50);
-
                 log.info("🔥 [PONTE IBKR | EXEC] Ordem {} para {} enviada à corretora. ID IBKR: {}", action, symbol, nextOrderId);
-
                 // Simulação de sucesso
                 OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada e confirmada na fila da IBKR.");
                 result.setOrderId(nextOrderId);
 
                 nextOrderId++; // Incrementa para o próximo ID
                 return result;
-
             } catch (Exception e) {
                 // Não agir por conta própria. Apenas logar o erro e retornar a falha.
                 log.error("❌ [PONTE IBKR | ERRO FATAL] Falha na comunicação ou Thread ao processar ordem para {}: {}", symbol, e.getMessage(), e);
@@ -66,27 +77,49 @@ public class IBKRGWClient {
         synchronized (orderQueueLock) {
             log.info("📢 [PONTE IBKR | FILA] Ordem de COMPRA {} para {} (Qtd: {}) ENQUEUE. ID Interno: {}",
                     action, symbol, quantity, nextOrderId);
-
             try {
                 if (quantity <= 0) {
                     log.error("❌ [PONTE IBKR | ERRO DIMENSIONAL] Ordem rejeitada: Quantidade ({}) é inválida. A Ponte CANCELA para não prejudicar o que já existe.", quantity);
                     return new OrderExecutionResult(false, "Quantidade dimensional inválida (zero ou negativa).");
                 }
 
+                // 🚨 VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE LIQUIDEZ (Excess Liquidity)
+                if (!isExcessLiquiditySufficient()) {
+                    log.error("❌ [PONTE IBKR | ERRO LIQUIDEZ] Ordem rejeitada: Excess Liquidity (R$ {}) insuficiente para a operação. Modo de Resgate pode estar ativo.",
+                            portfolioService.getExcessLiquidity().toPlainString());
+                    // 🛑 Retorna falha para forçar o tratamento no Principal (Modo de Resgate)
+                    return new OrderExecutionResult(false, "Excess Liquidity insuficiente. Ação vetada pela Ponte.");
+                }
+
                 Thread.sleep(50);
-
                 log.info("🔥 [PONTE IBKR | EXEC] Ordem {} para {} enviada à corretora. ID IBKR: {}", action, symbol, nextOrderId);
-
                 OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada e confirmada na fila da IBKR.");
                 result.setOrderId(nextOrderId);
 
                 nextOrderId++;
                 return result;
-
             } catch (Exception e) {
                 log.error("❌ [PONTE IBKR | ERRO FATAL] Falha na comunicação ou Thread ao processar ordem para {}: {}", symbol, e.getMessage(), e);
                 return new OrderExecutionResult(false, "Erro interno de concorrência/comunicação na Ponte: " + e.getMessage());
             }
         }
     }
+
+    // ====================================================================
+    // 3. MÉTODOS DE VALIDAÇÃO DE LIQUIDEZ (Usando SSOT)
+    // ====================================================================
+
+    /**
+     * ✅ Implementa a lógica para verificar se o Excess Liquidity é suficiente.
+     * Retorna TRUE apenas se o valor for positivo, garantindo a liquidez mínima.
+     */
+    private boolean isExcessLiquiditySufficient() {
+        // Obtém o valor real de Excess Liquidity do cache SSOT (LivePortfolioService)
+        BigDecimal excessLiquidity = portfolioService.getExcessLiquidity();
+        // A liquidez é considerada insuficiente se for ZERO ou NEGATIVA.
+        return excessLiquidity.compareTo(BigDecimal.ZERO) > 0;
+    }
+
+    // O método 'getExcessLiquidity' fictício não é mais necessário aqui,
+    // pois a lógica real está no LivePortfolioService.
 }

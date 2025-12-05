@@ -19,15 +19,15 @@ import org.springframework.web.bind.annotation.*;
 import java.math.BigDecimal;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
  * Controlador REST principal para interações com a ponte IBKR.
  * Centraliza todos os endpoints para status, ordens e informações da conta.
  *
- * Inclui correções de sinergia para:
- * 1. Unificação do fluxo de What-If para usar apenas o método sendWhatIfRequest().
- * 2. Gestão explícita da subscrição de Account Updates.
+ * ✅ AJUSTE CRÍTICO: O método /buying-power agora usa o LivePortfolioService.getFullLiquidityStatus(),
+ * que contém a Barreira de Sincronização para Margem Crítica (MaintMarginReq / InitMarginReq).
  */
 @RestController
 @RequestMapping("/api/ibkr")
@@ -46,7 +46,7 @@ public class IBKRController {
     @Autowired
     public IBKRController(IBKRConnector connector, OrderService orderService,
                           LivePortfolioService portfolioService, IBKRMapper ibkrMapper,
-                          OrderIdManager orderIdManager) {
+                          OrderIdManager orderIdManager, LivePortfolioService ivePortfolioService) {
         this.connector = connector;
         this.orderService = orderService;
         this.portfolioService = portfolioService;
@@ -67,6 +67,26 @@ public class IBKRController {
         return connector.isConnected()
                 ? ResponseEntity.ok("CONNECTED")
                 : ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body("DISCONNECTED");
+    }
+
+    @GetMapping("/market-price/{symbol}")
+    public ResponseEntity<BigDecimal> fetchLatestMarketPrice(@PathVariable String symbol) {
+        log.info("➡️ [PONTE | API] Requisição de preço FRESH on-demand recebida do Principal para: {}", symbol);
+        try {
+            // Assume que ibkrConnector na Ponte tem um método getLatestCachedPrice
+            Optional<BigDecimal> priceOpt = ibkrConnector.getLatestCachedPrice(symbol);
+
+            if (priceOpt.isEmpty()) {
+                log.warn("⬅️ [PONTE | API] Preço não encontrado em cache para {}. Retornando 404.", symbol);
+                return ResponseEntity.notFound().build();
+            }
+
+            log.info("⬅️ [PONTE | API] Preço FRESH retornado para {}: R$ {}", symbol, priceOpt.get().toPlainString());
+            return ResponseEntity.ok(priceOpt.get());
+        } catch (Exception e) {
+            log.error("❌ ERRO ao obter preço de mercado on-demand para {}.", symbol, e);
+            return ResponseEntity.internalServerError().body(BigDecimal.ZERO);
+        }
     }
 
     /**
@@ -101,7 +121,7 @@ public class IBKRController {
     }
 
     /**
-     * ✅ CORRIGIDO: Busca o poder de compra em tempo real, disparando um refresh assíncrono antes de retornar o cache.
+     * ✅ CORRIGIDO: Busca o poder de compra em tempo real, utilizando a Barreira de Sincronização.
      */
     @GetMapping("/buying-power")
     public ResponseEntity<AccountLiquidityDTO> getBuyingPower() {
@@ -111,7 +131,8 @@ public class IBKRController {
         if (!connector.isConnected()) {
             log.error("❌ Abortando: Conexão com a corretora não está ativa. Retornando DTO com ZEROS.");
             // RETORNO CORRIGIDO: 4 Argumentos (NLV, Cash, BP, EL)
-            return ResponseEntity.ok(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
+            AccountLiquidityDTO liquidityDTO = portfolioService.getFullLiquidityStatus();
+            return ResponseEntity.ok(liquidityDTO);
         }
 
         try {
@@ -122,7 +143,8 @@ public class IBKRController {
             // 2. Desativa a subscrição imediatamente após o disparo
             connector.getClient().reqAccountUpdates(false, "All");
 
-            // 3. Retorna IMEDIATAMENTE o DTO COMPLETO de liquidez do cache local
+            // 3. ✅ AJUSTE CRÍTICO: Retorna o DTO COMPLETO de liquidez do cache local,
+            // O LivePortfolioService fará a Barreira de Sincronização da Margem.
             AccountLiquidityDTO liquidityStatus = portfolioService.getFullLiquidityStatus();
 
             if (liquidityStatus.getCurrentBuyingPower().compareTo(BigDecimal.ZERO) <= 0) {
@@ -139,10 +161,19 @@ public class IBKRController {
             return ResponseEntity.ok(liquidityStatus);
 
         } catch (Exception e) {
-            log.error("❌ ERRO INESPERADO ao processar requisição de Buying Power. Retornando ZEROS no DTO.", e);
+            // Registra o erro detalhado
+            log.error("❌ ERRO INESPERADO ao processar requisição de Buying Power. Retornando DTO zerado (6 argumentos).", e);
+
+            // ✅ CORREÇÃO: Utiliza o construtor de 6 argumentos, passando BigDecimal.ZERO para todos eles.
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    // RETORNO CORRIGIDO NO CATCH: 4 Argumentos
-                    .body(new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO));
+                    .body(new AccountLiquidityDTO(
+                            BigDecimal.ZERO, // netLiquidationValue
+                            BigDecimal.ZERO, // cashBalance
+                            BigDecimal.ZERO, // currentBuyingPower
+                            BigDecimal.ZERO, // excessLiquidity
+                            BigDecimal.ZERO, // maintainMarginReq (MMR)
+                            BigDecimal.ZERO  // initMarginReq (IMR)
+                    ));
         } finally {
             log.info("------------------------------------------------------------");
         }
@@ -226,6 +257,8 @@ public class IBKRController {
         dto.setMktPrice(position.getAverageEntryPrice());
         return dto;
     }
+
+
 
     /**
      * Submete uma nova ordem ao TWS/Gateway.

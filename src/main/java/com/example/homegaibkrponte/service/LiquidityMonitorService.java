@@ -8,6 +8,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean; // Necessário para controle
 
 /**
  * Serviço de monitoramento periódico de liquidez.
@@ -25,6 +27,10 @@ public class LiquidityMonitorService {
     private final LivePortfolioService livePortfolioService; // 🎯 Fonte Única de Verdade (SSOT)
     private final WebhookNotifierService notifier; // Assumido no ecossistema
 
+    // 🛑 CONTROLE DE ESTADO: Garante que a espera só ocorra na primeira execução.
+    private final AtomicBoolean isInitialCheckDone = new AtomicBoolean(false);
+
+
     // Limiares de Alerta. Ajustar conforme a política de risco.
     private static final BigDecimal CRITICAL_THRESHOLD = new BigDecimal("1000"); // Alerta de caixa
     private static final BigDecimal WARNING_THRESHOLD = new BigDecimal("10000"); // Alerta de baixo nível
@@ -37,6 +43,21 @@ public class LiquidityMonitorService {
     public void monitorLiquidity() {
         log.info("⏰ [MONITOR-AUTO] Iniciando checagem programada de liquidez...");
         try {
+            // 🛑 AJUSTE CRÍTICO: Barreira de Sincronização na primeira execução (Fix para Race Condition)
+            if (isInitialCheckDone.compareAndSet(false, true)) {
+                log.warn("⏳ [MONITOR] Primeira checagem. Aguardando a sincronização crítica de Margem/Liquidez...");
+
+                // Espera pelo Latch que é liberado no LivePortfolioService (Ponte)
+                boolean ready = livePortfolioService.getCriticalMarginDataLatch().await(15, TimeUnit.SECONDS);
+
+                if (!ready) {
+                    log.error("❌ [MONITOR] TIMEOUT! Dados críticos de Margem/Liquidez não foram carregados após 15s. O monitoramento será iniciado, mas os dados podem estar incompletos.");
+                    // Permite que o monitoramento continue (lendo R$ 0.00 se for o caso), mas registra o erro de timeout.
+                } else {
+                    log.info("✅ [MONITOR] Barreira de Margem/Liquidez liberada. Iniciando monitoramento normal.");
+                }
+            }
+
             // 🎯 Obter o EL do cache da Ponte (LivePortfolioService)
             BigDecimal currentEL = livePortfolioService.getExcessLiquidity();
 
@@ -55,6 +76,9 @@ public class LiquidityMonitorService {
                 log.info("✅ [MONITOR-AUTO] EL SAUDÁVEL: R$ {}.", currentEL.toPlainString());
             }
 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("❌ [MONITOR-AUTO] Thread de monitoramento interrompida durante a espera.", e);
         } catch (Exception e) {
             log.error("❌ [MONITOR-AUTO] Falha no monitoramento automático de liquidez", e);
         }
@@ -67,6 +91,7 @@ public class LiquidityMonitorService {
     private void forceEmergencyRefresh() {
         try {
             log.warn("🔄 [MONITOR-AUTO] Forçando refresh de emergência (Snapshot IBKR)...");
+            // Nota: O requestAccountSummarySnapshot() usa o reqId genérico, o que é aceitável aqui.
             ibkrConnector.requestAccountSummarySnapshot();
 
             // Espera o callback retornar. Este tempo deve ser ajustado para a latência real.

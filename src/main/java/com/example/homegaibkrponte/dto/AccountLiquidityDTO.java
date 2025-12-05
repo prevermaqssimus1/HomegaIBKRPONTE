@@ -31,6 +31,13 @@ public class AccountLiquidityDTO {
     @JsonProperty("excessLiquidity")
     private BigDecimal excessLiquidity;
 
+    // ✅ ADIÇÕES CRÍTICAS: MMR e IMR
+    @JsonProperty("maintainMarginReq")
+    private BigDecimal maintainMarginReq; // <--- MMR
+
+    @JsonProperty("initMarginReq")
+    private BigDecimal initMarginReq;     // <--- IMR
+
 
     // * Adicione outros getters se necessário *
 }

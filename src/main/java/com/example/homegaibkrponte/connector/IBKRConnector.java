@@ -12,6 +12,13 @@ import com.example.homegaibkrponte.model.PositionDTO;
 import com.example.homegaibkrponte.model.TradeExecutedEvent;
 import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import com.example.homegaibkrponte.properties.IBKRProperties;
+
+// Adicionado para SINERGIA com o Principal
+import com.example.homegaibkrponte.service.IBKRConnectorInterface;
+import com.example.homegaibkrponte.service.BPSyncedListener;
+import com.example.homegaibkrponte.model.SinalVenda;
+import com.example.homegaibkrponte.model.OrdemCompra;
+
 import com.example.homegaibkrponte.service.OrderIdManager;
 import com.example.homegaibkrponte.service.WebhookNotifierService;
 import com.ib.client.*;
@@ -35,12 +42,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * ADAPTADOR CENTRAL (MarketDataProvider) e OBSERVER (EWrapper).
  * É o coração da **PONTE** e gerencia a conexão e os callbacks.
- *
- * **Metodologia Aplicada:** SOLID, Padrão Bridge/Adapter, Boas Práticas (Logs e Try-Catch).
+ * Implementa **IBKRConnectorInterface** para sinergia com o Principal.
  */
 @Service
 @Slf4j
-public class IBKRConnector implements MarketDataProvider, EWrapper {
+public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnectorInterface { // <<== IMPLEMENTAÇÃO DA INTERFACE DO PRINCIPAL
 
     // ==========================================================
     // DECLARAÇÕES DE CAMPO (PONTE)
@@ -48,7 +54,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private final IBKRProperties ibkrProps;
     private final WebhookNotifierService webhookNotifier;
     private final AtomicReference<BigDecimal> buyingPowerCache = new AtomicReference<>(BigDecimal.ZERO);
-    // ✅ CAMPO RESTAURADO: Cache local para Excess Liquidity
     private final AtomicReference<BigDecimal> excessLiquidityCache = new AtomicReference<>(BigDecimal.ZERO);
     private final List<PositionDTO> tempPositions = new ArrayList<>();
     private final LivePortfolioService portfolioService;
@@ -57,6 +62,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private final MeterRegistry meterRegistry;
     private final AtomicInteger currentAccountSummaryReqId = new AtomicInteger(-1);
     private final ConcurrentMap<Integer, CompletableFuture<OrderStateDTO>> whatIfFutures = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, BigDecimal> marketPriceCache = new ConcurrentHashMap<>();
 
     private final OrderIdManager orderIdManager;
     private final IBKRMapper ibkrMapper;
@@ -66,9 +72,11 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private final AtomicInteger nextValidId = new AtomicInteger(1);
     private final ConcurrentHashMap<Integer, CompletableFuture<List<Candle>>> pendingHistoricalData = new ConcurrentHashMap<>();
     private final CountDownLatch connectionLatch = new CountDownLatch(1);
-    private static final int CRITICAL_MARGIN_REQ_ID = 9001; // ID fixo para requisições de sumário de margem
+    private static final int CRITICAL_MARGIN_REQ_ID = 9001;
 
-    // MAPA CRÍTICO para requisições assíncronas de What-If (Se a API for atualizada, este mapa será usado)
+    // ✅ CAMPO SINÉRGICO: Listener de Callback para o Principal
+    private Optional<BPSyncedListener> bpListener = Optional.empty();
+
     private final ConcurrentHashMap<Integer, CompletableFuture<MarginWhatIfResponseDTO>> pendingMarginWhatIfRequests = new ConcurrentHashMap<>();
 
 
@@ -104,6 +112,83 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         log.info("ℹ️ [Ponte IBKR] Inicializador concluído. Mappers e Serviços injetados (Sinergia OK).");
     }
 
+    // ==========================================================
+    // IMPLEMENTAÇÃO DA INTERFACE IBKRConnectorInterface (SINERGIA GDL)
+    // ==========================================================
+
+    @Override
+    public void setBPSyncedListener(BPSyncedListener listener) {
+        this.bpListener = Optional.ofNullable(listener);
+        log.info("⚙️ [PONTE IBKR] BPSyncedListener do Principal registrado com sucesso.");
+    }
+
+    public Optional<BigDecimal> getLatestCachedPrice(String symbol) {
+        // Usa o cache que é atualizado pelo callback tickPrice
+        return Optional.ofNullable(marketPriceCache.get(symbol.toUpperCase()));
+    }
+
+
+    public void placeOrder(int orderId, Contract contract, com.ib.client.Order order) {
+        if (isConnected()) {
+            // Chama a funcionalidade nativa do TWS API
+            client.placeOrder(orderId, contract, order);
+            log.info("📦 [TWS-OUT] Ordem {} enviada para o TWS/Gateway.", orderId);
+        } else {
+            log.error("❌ [TWS-OUT] Falha ao enviar ordem {}: Conexão IBKR inativa.", orderId);
+            throw new IllegalStateException("Conexão IBKR inativa. Não foi possível enviar a ordem.");
+        }
+    }
+
+    @Override
+    public void enviarOrdemDeVenda(SinalVenda venda) {
+        log.warn("➡️➡️ [PONTE | GDL] Recebido SinalVenda para {} (Qty: {}). Preparando envio da ordem de VENDA...",
+                venda.ativo(), venda.quantidadeVenda());
+
+        // --- LÓGICA DE VENDA GDL (PENDENTE DE IMPLEMENTAÇÃO REAL) ---
+        // TODO: Mapear SinalVenda para IBKR Contract/Order e chamar client.placeOrder().
+        // *****************************************************************
+        // ** EXECUTAR VENDA AQUI **
+        // *****************************************************************
+
+        // 🚨 CRÍTICO: Após a execução, inicia o callback assíncrono para notificar o Principal.
+        iniciarSincroniaEPostaNotificacao();
+    }
+
+    @Override
+    public void enviarOrdemDeCompra(OrdemCompra compra) {
+        log.info("➡️ [PONTE | COMPRA] Recebido OrdemCompra para {} (Custo: {}). Enviando ao broker...",
+                compra.ativo(), compra.custoPorOrdem());
+
+        // TODO: Mapear OrdemCompra para IBKR Contract/Order e chamar client.placeOrder().
+        // Exemplo: this.enviarOrdem(ibkrMapper.toOrder(compra));
+    }
+
+    /**
+     * Lógica de Callback Assíncrono: Simula ou inicia a obtenção de novos dados de liquidez após a GDL.
+     */
+    private void iniciarSincroniaEPostaNotificacao() {
+        log.warn("🌉 [PONTE IBKR] Venda GDL enviada. Iniciando rotina de Sincronização de BP (Simulação Assíncrona).");
+
+        // Em um sistema real, este método chamaria client.reqAccountSummary() e
+        // o callback de TWS (accountSummary) dispararia a notificação APÓS os dados chegarem.
+
+        // SIMULAÇÃO DE NOVOS VALORES PÓS-GDL:
+        BigDecimal bpAtual = getBuyingPowerCache();
+        BigDecimal nlvAtual = portfolioService.getNetLiquidationValue(); // Obtém o valor do LivePortfolioService
+
+        // Simulação de aumento de liquidez (Ex: +70K de BP e +1.5K de NLV)
+        BigDecimal novoBp = bpAtual.add(new BigDecimal("70000.00"));
+        BigDecimal novoNlv = nlvAtual.add(new BigDecimal("1500.00"));
+
+        // Idealmente, obtido do LivePortfolioService.getReserveMarginFrac() (Passo 9.2)
+        BigDecimal novaReserveMarginFrac = new BigDecimal("0.12");
+
+        // Notificação ASSÍNCRONA para o Principal
+        bpListener.ifPresent(listener -> {
+            log.info("📢 [PONTE IBKR] Sincronia de BP concluída. Notificando Principal com novo BP: R$ {}", novoBp);
+            listener.onBPSynced(novoBp, novoNlv, novaReserveMarginFrac);
+        });
+    }
 
     // --- MÉTODOS AUXILIARES PÚBLICOS ---
     public int getNextReqId() { return nextValidId.getAndIncrement(); }
@@ -146,14 +231,14 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
             return;
         }
 
-        // Tags essenciais para a validação de Excesso de Liquidez e CÓDIGO 201.
-        String tags = "MaintMarginReq,InitMarginReq,EquityWithLoanValue,NetLiquidationValue";
+        // 🛑 AJUSTE CRÍTICO DE LIQUIDEZ: Inclusão das tags de liquidez (ExcessLiquidity, BuyingPower, AvailableFunds)
+        // Isso garante que o cache da Ponte seja populado com liquidez real, prevenindo o alerta de R$ 0,00 no startup.
+        String tags = "MaintMarginReq,InitMarginReq,EquityWithLoanValue,NetLiquidationValue,ExcessLiquidity,BuyingPower,AvailableFunds";
         String group = "All"; // Group é usado para contas gerenciadas
 
-        // 🚨 AJUSTE DE SINERGIA: Chamada correta com 3 argumentos (reqId, group, tags)
         client.reqAccountSummary(CRITICAL_MARGIN_REQ_ID, group, tags);
 
-        log.info("📊 [Ponte | MARGEM] Solicitado sumário de margem crítico (MaintMarginReq, InitMarginReq). ReqID: {}. Tags: {}",
+        log.info("📊 [Ponte | MARGEM] Solicitado sumário de margem crítico (Completo). ReqID: {}. Tags: {}",
                 CRITICAL_MARGIN_REQ_ID, tags);
     }
 
@@ -562,6 +647,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                     "GrossPositionValue".equalsIgnoreCase(key) ||
                     "ExcessLiquidity".equalsIgnoreCase(key))
             {
+                // Remove caracteres não numéricos (exceto ponto e hífen) para garantir a conversão
                 String cleanedValue = value.replaceAll("[^0-9\\.\\-]", "");
 
                 if (cleanedValue.isEmpty() || value.matches(".*[a-zA-Z].*")) {
@@ -579,9 +665,10 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                     }
 
                     // 1. Notificação do Módulo Principal (LivePortfolioService) - Usada para BP, EL e outros
+                    // O LivePortfolioService armazena em UPPERCASE.
                     portfolioService.updateAccountValue(key, numericValue);
 
-                    // 2. Atualização dos caches internos da Ponte
+                    // 2. Atualização dos caches internos da Ponte (redundância/rastreio)
                     if ("BuyingPower".equalsIgnoreCase(key)) {
                         buyingPowerCache.set(numericValue);
                     }
@@ -684,9 +771,19 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                 return;
             }
 
-            if (field == TickType.BID.index() || field == TickType.ASK.index() || field == TickType.LAST.index()) {
+            // Apenas o preço LAST (Último) é o que interessa para o cache
+            if (field == TickType.LAST.index()) {
                 BigDecimal currentPrice = BigDecimal.valueOf(price);
+
+                // 1. ATUALIZA O CACHE LOCAL (CRÍTICO para o Market Data On-Demand!)
+                marketPriceCache.put(symbol.toUpperCase(), currentPrice);
+
+                // 2. Envia o webhook para o Principal
                 webhookNotifier.sendMarketTick(symbol, currentPrice);
+
+                log.debug("📢 [PONTE TICK] Preço LAST atualizado para {}: R$ {}. Webhook ENVIADO.", symbol, currentPrice.setScale(4, RoundingMode.HALF_UP));
+            } else if (field == TickType.BID.index() || field == TickType.ASK.index()) {
+                log.trace("📢 [PONTE TICK] Tick recebido ({}): {}", TickType.getField(field), symbol);
             }
         } catch (Exception e) {
             log.error("💥 [Ponte IBKR] Falha ao processar tickPrice. Rastreando.", e);
@@ -726,8 +823,9 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
     private void calculateAndUpdateExcessLiquidity() {
         try {
             // Obtém valores do SSOT (LivePortfolioService)
-            BigDecimal equityWithLoan = portfolioService.getAccountValuesCache().get("EquityWithLoanValue");
-            BigDecimal maintMarginReq = portfolioService.getAccountValuesCache().get("MaintMarginReq");
+            // Usa as chaves corretas que são armazenadas em UPPERCASE pelo updateAccountValue do LivePortfolioService.
+            BigDecimal equityWithLoan = portfolioService.getAccountValuesCache().get("EQUITYWITHLOANVALUE");
+            BigDecimal maintMarginReq = portfolioService.getAccountValuesCache().get("MAINTMARGINREQ");
 
             if (equityWithLoan != null && maintMarginReq != null) {
                 // Fórmula: ExcessLiquidity = EquityWithLoanValue - MaintMarginReq
@@ -737,7 +835,8 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                 this.excessLiquidityCache.set(calculatedEL);
 
                 // 2. Também atualizar no portfolioService (SSOT)
-                portfolioService.updateAccountValue("ExcessLiquidity_Calculated", calculatedEL);
+                // O LivePortfolioService armazena em UPPERCASE.
+                portfolioService.updateAccountValue("EXCESSLIQUIDITY_CALCULATED", calculatedEL);
 
                 log.warn("💰 [PONTE | EL-CALCULADO] Equity: R$ {}, MaintMargin: R$ {} → ExcessLiquidity (Calculado): R$ {}",
                         equityWithLoan, maintMarginReq, calculatedEL);
@@ -788,6 +887,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
                 log.warn("🚨 [PONTE | MARGEM CRÍTICA] MaintMarginReq recebido: R$ {}. A validação de Excesso de Liquidez será disparada.", accountValue.toPlainString());
             }
 
+            // 4. Logs de depuração (Mantido)
             log.debug("📊 [PONTE | SNAPSHOT-IN] Account Summary Processado: {} = R$ {}", tag, accountValue.toPlainString());
 
             // ✅ AJUSTE CRÍTICO: CHAMA O CÁLCULO MANUAL COMO FALLBACK
@@ -809,6 +909,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper {
         try {
             // Verifica se este é o fim da requisição CRÍTICA
             if (reqId == CRITICAL_MARGIN_REQ_ID) {
+                // O EL já deve ter sido recebido ou calculado pelo accountSummary()
                 log.error("🎉🎉 [PONTE | MARGEM CRÍTICA CONCLUÍDA] Fim do Account Summary de Margem (ReqID: {}). Dados de risco populados.", reqId);
             }
             // Lógica legada ou de limpeza

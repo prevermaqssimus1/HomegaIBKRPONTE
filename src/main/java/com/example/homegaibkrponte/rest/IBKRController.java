@@ -89,6 +89,25 @@ public class IBKRController {
         }
     }
 
+    @PostMapping("/sync")
+    public ResponseEntity<Void> forceSync() {
+        log.info("🔄 [Ponte | API] Comando de sincronização forçada. Limpando subscrições anteriores para evitar Erro 322.");
+        try {
+            // 1. Cancela subscrição anterior para evitar o limite de requisições da IBKR
+            connector.getClient().cancelAccountSummary(9001);
+
+            // 2. Solicita atualização fresca de TUDO (Conta e Posições)
+            connector.getClient().reqAccountUpdates(true, connector.getAccountId());
+            connector.getClient().reqAccountSummary(9001, "All",
+                    "NetLiquidation,EquityWithLoanValue,BuyingPower,ExcessLiquidity,InitMarginReq,MaintMarginReq");
+
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            log.error("❌ [Ponte] Erro ao disparar Sync: {}", e.getMessage());
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
     /**
      * 🚨 NOVO ENDPOINT (SINERGIA): Força a sincronização completa dos valores de conta (BP, EL, NLV) do TWS.
      * Após a requisição, a subscrição é desativada imediatamente.
@@ -273,7 +292,7 @@ public class IBKRController {
             OrderDTO resultDto = orderService.placeOrder(orderDto);
 
             // Log de Saída - Indica que a ordem foi submetida com sucesso ao TWS/Gateway
-            log.info("🚀 [Ponte | Controller] Ordem SUBMETIDA. ClientID: {}, ID IBKR: {}. Aguardando callbacks de status.",
+            log.info("🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀 [Ponte | Controller] Ordem SUBMETIDA. ClientID: {}, ID IBKR: {}. Aguardando callbacks de status.",
                     resultDto.clientOrderId(), resultDto.orderId());
 
             return ResponseEntity.ok(resultDto);

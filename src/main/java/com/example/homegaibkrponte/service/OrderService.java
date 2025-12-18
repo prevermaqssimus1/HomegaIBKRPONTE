@@ -27,6 +27,7 @@ public class OrderService {
     private final ContractFactory contractFactory;
     private final OrderFactory orderFactory;
     private final LivePortfolioService portfolioService;
+    private  OrderDTO orderDto;
 
     /**
      * Ponto de entrada para receber ordens via REST.
@@ -37,16 +38,20 @@ public class OrderService {
             throw new IllegalStateException("Não é possível enviar ordem: Desconectado do TWS/Gateway.");
         }
 
-        // 🚨 VETO DE LIQUIDEZ DE ALTO NÍVEL (Novo Veto Central)
-        if (!isExcessLiquiditySufficient()) {
+        // 🚨 VETO DE LIQUIDEZ INTELIGENTE (CORREÇÃO DE BLOQUEIO CIRCULAR)
+        // Identificamos se é uma ordem de redução (SELL ou fechar short BUY_TO_COVER)
+        // Essas ordens DEVEM passar mesmo com Excess Liquidity negativo para recuperar a conta.
+        boolean isReductionOrder = orderDto.type().getSide().equalsIgnoreCase("SELL") ||
+                orderDto.type().name().equalsIgnoreCase("BUY_TO_COVER");
+
+        if (!isReductionOrder && !isExcessLiquiditySufficient()) {
             BigDecimal el = portfolioService.getExcessLiquidity();
-            log.error("❌ [Ponte | ORDER-SERVICE | VETO] Ordem {} REJEITADA. Excess Liquidity (R$ {}) insuficiente para qualquer nova ordem.",
+            log.error("❌ [Ponte | ORDER-SERVICE | VETO] Ordem de COMPRA {} REJEITADA. Excess Liquidity (R$ {}) insuficiente. Apenas vendas permitidas para recuperação.",
                     orderDto.clientOrderId(), el.toPlainString());
-            throw new IllegalStateException("Ação vetada: Excess Liquidity zerado ou negativo. Sistema em Modo de Resgate.");
+            throw new IllegalStateException("Ação vetada: Excess Liquidity insuficiente para novas compras. Use ordens de venda para recuperar margem.");
         }
 
         // Log de Entrada (SINERGIA: Usando rationale para o 'SINAL' do Domínio Principal)
-        // ... (resto do código do placeOrder)
         log.info("⚙️ [Ponte | ORDER-SERVICE] Recebendo ordem {}. Ativo: {}, SINAL: {}, Tipo IBKR: {}.",
                 orderDto.clientOrderId(),
                 orderDto.symbol(),
@@ -76,6 +81,8 @@ public class OrderService {
         }
     }
 
+
+
     private boolean isExcessLiquiditySufficient() {
         // Obtém o valor real de Excess Liquidity do cache SSOT
         BigDecimal excessLiquidity = portfolioService.getExcessLiquidity(); // Obtido de LivePortfolioService
@@ -85,9 +92,6 @@ public class OrderService {
     // --- LÓGICA ATÔMICA BRACKET ORDER (Fase 9) ---
 
     private OrderDTO handleBracketOrder(OrderDTO masterOrderDto) {
-        // ... (Validações de Estrutura: 1, 2) e (Geração de IDs: 3) e (Configuração OCO/Parent: 4) ...
-        // (Assumindo que os passos 1 a 4 acima estão no corpo do método)
-
         // 1. Validação (Apenas da estrutura)
         if (masterOrderDto.childOrders().size() != 2) {
             log.error("❌ [Ponte | VAL-BRACKET] A Ordem Bracket para {} não contém as 2 ordens de proteção (SL/TP).", masterOrderDto.symbol());
@@ -179,7 +183,7 @@ public class OrderService {
 
         try {
             // Log de ENTRADA DA VENDA/COMPRA
-            log.info("🚀 [Ponte | EXEC-SIMPLES] Enviando ordem SIMPLES para TWS. ID IBKR: {}, Ação: {}, Tipo: {}, Ativo: {}.",
+            log.info("🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀 [Ponte | EXEC-SIMPLES] Enviando ordem SIMPLES para TWS. ID IBKR: {}, Ação: {}, Tipo: {}, Ativo: {}.",
                     ibkrOrderId, ibkrOrder.action(), ibkrOrder.orderType(), contract.symbol());
 
             connector.getClient().placeOrder(ibkrOrderId, contract, ibkrOrder);

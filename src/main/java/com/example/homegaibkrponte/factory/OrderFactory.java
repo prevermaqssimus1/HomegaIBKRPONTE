@@ -32,58 +32,49 @@ public class OrderFactory {
      * Cria um objeto Order nativo da IBKR a partir do nosso OrderDTO.
      */
     public Order create(OrderDTO dto, String ibkrClientOrderId) {
-
         Order ibkrOrder = new Order();
 
-        // 1. Mapeamento Básico de Fields
         ibkrOrder.orderId(Integer.parseInt(ibkrClientOrderId));
-        // ✅ Boa Prática: Usar Decimal.get() para maior precisão
         ibkrOrder.totalQuantity(Decimal.get(dto.quantity()));
 
-        // 2. Mapeamento CRÍTICO: Ação (BUY/SELL)
-        // Obtém a string da Ação (BUY ou SELL) do OrderTypeEnum do Principal (Fonte da Ação)
         String actionString = dto.type().getSide();
-        ibkrOrder.action(actionString); // Define a Ação TWS (Ex: "BUY" ou "SELL")
+        ibkrOrder.action(actionString);
 
-        // 3. Mapeamento CRÍTICO do Tipo de Ordem da PONTE (MKT, LMT, STP)
         com.ib.client.OrderType ibkrType = determineIbkrOrderType(dto.type());
         ibkrOrder.orderType(ibkrType.name());
 
-        // 4. Definição de Preços (Com base no tipo da PONTE)
-
         if (ibkrType == OrderType.MKT) {
-            // Para MKT, o preço e o preço auxiliar DEVEM ser zero.
             ibkrOrder.lmtPrice(PRICE_ZERO);
             ibkrOrder.auxPrice(PRICE_ZERO);
 
+            // ✅ AJUSTE CRÍTICO: Sinaliza intenção de compensação direta para facilitar
+            // aceitação de ordens de fechamento em cenários de margem baixa.
+            ibkrOrder.clearingIntent("IB");
+
         } else if (ibkrType == OrderType.LMT) {
-            // Ordem LMT pura, TAKE_PROFIT, ou Resgate Inteligente
-            double limitPrice = Optional.ofNullable(dto.takeProfitPrice()) // Prioriza TP se for o caso
-                    .or(() -> Optional.ofNullable(dto.limitPrice())) // Prioriza limitPrice (Resgate Inteligente)
-                    .or(() -> Optional.ofNullable(dto.price())) // Fallback para preço genérico
+            double limitPrice = Optional.ofNullable(dto.takeProfitPrice())
+                    .or(() -> Optional.ofNullable(dto.limitPrice()))
+                    .or(() -> Optional.ofNullable(dto.price()))
                     .filter(p -> p.compareTo(BigDecimal.ZERO) > 0)
-                    .orElseThrow(() -> new IllegalStateException("Ordem LMT requer um preço limite válido."))
+                    .orElseThrow(() -> new IllegalStateException("Ordem LMT requer preço."))
                     .doubleValue();
             ibkrOrder.lmtPrice(limitPrice);
         }
-
-        // 🚨 Mapeamento de STOP (STP) - Reforçando a lógica:
-        // Cobre BUY_STOP, SELL_STOP, SELL_STOP_LOSS, BUY_STOP_LOSS
         else if (ibkrType == OrderType.STP) {
-            // O preço de Stop (auxPrice) pode vir de stopLossPrice (para SL/TP) ou do price principal (para STP simples)
-            double stopPrice = Optional.ofNullable(dto.stopLossPrice()) // Prioriza stopLossPrice se for SL
-                    .or(() -> Optional.ofNullable(dto.price())) // Fallback para preço (para BUY_STOP/SELL_STOP)
+            double stopPrice = Optional.ofNullable(dto.stopLossPrice())
+                    .or(() -> Optional.ofNullable(dto.price()))
                     .filter(p -> p.compareTo(BigDecimal.ZERO) > 0)
-                    .orElseThrow(() -> new IllegalStateException("Ordem STOP requer um preço de stop válido."))
+                    .orElseThrow(() -> new IllegalStateException("Ordem STOP requer preço."))
                     .doubleValue();
             ibkrOrder.auxPrice(stopPrice);
-            ibkrOrder.lmtPrice(PRICE_ZERO); // STP não tem preço limite, apenas o gatilho (auxPrice)
+            ibkrOrder.lmtPrice(PRICE_ZERO);
         }
 
-        // 5. Configurações de Risco/Sessão (CRÍTICO: Conta)
         ibkrOrder.tif("GTC");
         ibkrOrder.outsideRth(true);
-        ibkrOrder.account(connector.getAccountId()); // Garante o accountId correto
+
+        // Garante que a conta correta está sendo usada no envio
+        ibkrOrder.account(connector.getAccountId());
 
         return ibkrOrder;
     }
@@ -94,26 +85,12 @@ public class OrderFactory {
      * @param orderType O enum de tipo de ordem da aplicação Principal.
      */
     private com.ib.client.OrderType determineIbkrOrderType(OrderTypeEnum orderType) {
-
-        // Mapeia os tipos de domínio para os tipos nativos da IBKR.
         return switch (orderType) {
-            // Mercado
             case BUY_MARKET, SELL_MARKET, MKT -> com.ib.client.OrderType.MKT;
-
-            // Limitada (Inclui ordens de lucro, que são LMT)
             case BUY_LIMIT, SELL_LIMIT, SELL_TAKE_PROFIT, BUY_TAKE_PROFIT, LMT -> com.ib.client.OrderType.LMT;
-
-            // Stop (Inclui ordens de proteção, que são STP)
             case BUY_STOP, SELL_STOP, SELL_STOP_LOSS, BUY_STOP_LOSS -> com.ib.client.OrderType.STP;
-
-            // Tratamento especial para BUY_TO_COVER
-            case BUY_TO_COVER -> com.ib.client.OrderType.MKT; // Usado para execução imediata
-
-            default -> {
-                // Logar o erro e retornar o tipo MKT como fallback seguro
-                System.err.println("Tipo de Ordem do Principal desconhecido: " + orderType + ". Usando MKT como fallback.");
-                yield com.ib.client.OrderType.MKT;
-            }
+            case BUY_TO_COVER -> com.ib.client.OrderType.MKT;
+            default -> com.ib.client.OrderType.MKT;
         };
     }
 }

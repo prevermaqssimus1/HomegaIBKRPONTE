@@ -1,67 +1,81 @@
 package com.example.homegaibkrponte.service;
 
-import com.example.homegaibkrponte.properties.IBKRProperties; // SINERGIA: Configurações da Ponte
+import com.example.homegaibkrponte.properties.IBKRProperties;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Gerencia a sequência de IDs de ordem de forma centralizada e thread-safe.
- * Utiliza o padrão Singleton (gerenciado pelo Spring).
- * SRP: Sua única responsabilidade é fornecer IDs de ordem e IDs de conta/cliente da Ponte.
+ * 🌉 PONTE | GESTÃO DE IDENTIFICADORES
+ * Gerencia a sequência de IDs de ordem garantindo unicidade e sinergia com a TWS.
+ * Implementa Salto de Segurança para resolver Erro 103 (Duplicate Order ID). [cite: 334]
  */
 @Service
-@RequiredArgsConstructor // Lombok gera o construtor com IBKRProperties (injetado)
+@RequiredArgsConstructor
+@Slf4j
 public class OrderIdManager {
 
-    // 💡 SINERGIA: Injeção das propriedades para obter ClientId e AccountId.
     private final IBKRProperties ibkrProps;
 
-    // Utiliza AtomicInteger para garantir operações atômicas e seguras em ambiente multi-thread.
+    // Inicializado com -1 para forçar a sincronização via nextValidId da TWS
     private final AtomicInteger nextOrderId = new AtomicInteger(-1);
 
     /**
-     * Inicializa ou atualiza o contador com o próximo ID válido fornecido pela API da IBKR.
-     * Este método deve ser chamado assim que a conexão com o TWS é estabelecida (no nextValidId do Connector).
-     * @param validId O próximo ID de ordem válido.
+     * 🚀 INICIALIZAÇÃO COM SALTO DE SEGURANÇA
+     * Resolve o Erro 103 garantindo que o ID esteja sempre à frente do histórico da TWS. [cite: 334]
      */
     public synchronized void initializeOrUpdate(int validId) {
-        // Garante que o ID só seja definido uma vez ou atualizado se o novo for maior.
-        if (this.nextOrderId.get() < validId) {
-            this.nextOrderId.set(validId);
-            System.out.println("✅ Contador de ID de Ordem inicializado com: " + validId);
+        // 🛡️ SINERGIA: Aplicamos um salto de 2000 unidades sobre o ID sugerido pela TWS. [cite: 325, 360]
+        // Isso garante que ordens de sessões anteriores não causem conflito.
+        int safeId = validId + 2000;
+
+        int current = this.nextOrderId.get();
+        if (safeId > current) {
+            this.nextOrderId.set(safeId);
+            log.error("✅ [OrderIdManager] ID sincronizado com SALTO DE SEGURANÇA. Próximo ID: {}", safeId);
+        }
+    }
+
+    /**
+     * ⚠️ SALTO FORÇADO DE EMERGÊNCIA
+     * Use este método quando o erro 103 for detectado em tempo de execução.
+     */
+    public synchronized void forceIdJump() {
+        int currentId = nextOrderId.get();
+        if (currentId != -1) {
+            int jumpedId = currentId + 1000;
+            nextOrderId.set(jumpedId);
+            log.error("🚀 [OrderIdManager | EMERGENCY] Salto forçado de 1000 unidades aplicado. Novo ID: {}", jumpedId);
         }
     }
 
     /**
      * Obtém o próximo ID de ordem disponível de forma atômica.
-     * @return O próximo ID de ordem único.
      */
     public int getNextOrderId() {
-        if (nextOrderId.get() == -1) {
-            // Lança uma exceção se o serviço for usado antes da inicialização.
-            throw new IllegalStateException("O OrderIdManager não foi inicializado com um ID válido da IBKR.");
+        int id = nextOrderId.get();
+        if (id == -1) {
+            log.error("🛑 [CRÍTICO] Tentativa de obter ID antes da sincronização com a TWS.");
+            throw new IllegalStateException("OrderIdManager não inicializado.");
         }
-        // Incrementa e depois retorna o valor, garantindo que cada chamada receba um ID único.
         return this.nextOrderId.getAndIncrement();
     }
 
     /**
-     * ✅ NOVO MÉTODO: Obtém o ID do Cliente (ClientId) configurado para esta Ponte.
-     * @return O Client ID da IBKR (configurado no application.properties via IBKRProperties).
+     * Retorna o ID atual sem incrementar (para monitoramento).
      */
+    public int getCurrentId() {
+        return nextOrderId.get();
+    }
+
     public int getClientId() {
         return ibkrProps.clientId();
     }
 
-    /**
-     * ✅ NOVO MÉTODO: Obtém o ID da Conta (AccountId) configurado para esta Ponte.
-     * @return O Account ID da IBKR (configurado no application.properties via IBKRProperties).
-     */
     public String getAccountId() {
-        // Assume que IBKRProperties tem um método 'accountId()'
-        // IMPORTANTE: Esse valor é necessário para a IBKR para identificar a conta.
+        // Retorna a conta DUN652604 [cite: 284]
         return ibkrProps.accountId();
     }
 }

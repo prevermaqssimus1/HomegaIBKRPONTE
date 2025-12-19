@@ -1,125 +1,82 @@
 package com.example.homegaibkrponte.client;
 
 import com.example.homegaibkrponte.model.OrderExecutionResult;
-import com.example.homegaibkrponte.monitoring.LivePortfolioService; // 1. NOVO IMPORT
+import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.math.BigDecimal; // NOVO IMPORT
-import lombok.RequiredArgsConstructor; // NOVO IMPORT
+import java.math.BigDecimal;
+import lombok.RequiredArgsConstructor;
 
 /**
- * CLASSE DA PONTE (Bridge): Cliente de Comunicação com o Gateway da IBKR.
- * É a ÚNICA classe responsável por enviar ordens à corretora.
- * Garante a serialização e o controle de concorrência da fila de ordens.
- * Implementa o Princípio da Responsabilidade Única (SRP - SOLID).
+ * 🌉 CLASSE DA PONTE: Ajustada para permitir Desalavancagem Crítica.
+ * ✅ SUSTENTABILIDADE: Venda permitida mesmo com EL negativo para restaurar margem.
  */
 @Service
-@RequiredArgsConstructor // Usado para injetar dependências no construtor
+@RequiredArgsConstructor
 public class IBKRGWClient {
 
     private static final Logger log = LoggerFactory.getLogger(IBKRGWClient.class);
-    // Variável para garantir a lógica de serialização e controle de concorrência (Fila de Order)
     private final Object orderQueueLock = new Object();
     private long nextOrderId = 1;
-
-    // 1. INJEÇÃO DO SERVIÇO SSOT (LivePortfolioService)
     private final LivePortfolioService portfolioService;
 
     // ====================================================================
-    // 1. MÉTODO DE VENDA (SAÍDA)
+    // 1. MÉTODO DE VENDA (LIBERA MARGEM)
     // ====================================================================
-
     public OrderExecutionResult placeSellOrder(String symbol, long quantity, String action, String reason) {
-        // Garantindo a Sinergia e Concorrência: A Fila de Ordem
         synchronized (orderQueueLock) {
-            log.info("📢 [PONTE IBKR | FILA] Ordem de VENDA {} para {} (Qtd: {}) ENQUEUE. ID Interno: {}",
-                    action, symbol, quantity, nextOrderId);
-            // TRY-CATCH para rastrear o que acontece no código
             try {
-                // VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE QUANTIDADE
-                if (quantity <= 0) {
-                    log.error("❌ [PONTE IBKR | ERRO DIMENSIONAL] Ordem rejeitada: Quantidade ({}) é inválida. A Ponte CANCELA para não prejudicar o que já existe.", quantity);
-                    return new OrderExecutionResult(false, "Quantidade dimensional inválida (zero ou negativa).");
-                }
+                if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");
 
-                // 🚨 2. VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE LIQUIDEZ (Excess Liquidity)
-                if (!isExcessLiquiditySufficient()) {
-                    log.error("❌ [PONTE IBKR | ERRO LIQUIDEZ] Ordem rejeitada: Excess Liquidity (R$ {}) insuficiente para a operação. Modo de Resgate pode estar ativo.",
-                            portfolioService.getExcessLiquidity().toPlainString());
-                    // 🛑 Retorna falha para forçar o tratamento no Principal (Modo de Resgate)
-                    return new OrderExecutionResult(false, "Excess Liquidity insuficiente. Ação vetada pela Ponte.");
-                }
+                // 🛡️ AJUSTE CRÍTICO: Removido o veto de Excess Liquidity para VENDAS.
+                // Vender ativos reduz a Margem de Manutenção e ajuda a sair do negativo.
 
-                // Simulação do envio real da ordem via socket ou API IBKR
+                log.info("🔥 [PONTE IBKR | EXEC] Enviando VENDA de {} para restaurar liquidez. ID: {}", symbol, nextOrderId);
+
+                // Simulação da chamada de rede para a TWS/Gateway
                 Thread.sleep(50);
-                log.info("🔥 [PONTE IBKR | EXEC] Ordem {} para {} enviada à corretora. ID IBKR: {}", action, symbol, nextOrderId);
-                // Simulação de sucesso
-                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada e confirmada na fila da IBKR.");
-                result.setOrderId(nextOrderId);
 
-                nextOrderId++; // Incrementa para o próximo ID
+                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem de venda enviada.");
+                result.setOrderId(nextOrderId++);
                 return result;
             } catch (Exception e) {
-                // Não agir por conta própria. Apenas logar o erro e retornar a falha.
-                log.error("❌ [PONTE IBKR | ERRO FATAL] Falha na comunicação ou Thread ao processar ordem para {}: {}", symbol, e.getMessage(), e);
-                return new OrderExecutionResult(false, "Erro interno de concorrência/comunicação na Ponte: " + e.getMessage());
+                log.error("❌ [ERRO FATAL] Falha na venda de {}: {}", symbol, e.getMessage());
+                return new OrderExecutionResult(false, e.getMessage());
             }
         }
     }
 
     // ====================================================================
-    // 2. MÉTODO DE COMPRA (ENTRADA) - ADICIONADO PARA SINERGIA TOTAL
+    // 2. MÉTODO DE COMPRA (CONSOME MARGEM)
     // ====================================================================
-
     public OrderExecutionResult placeBuyOrder(String symbol, long quantity, String action, String reason) {
         synchronized (orderQueueLock) {
-            log.info("📢 [PONTE IBKR | FILA] Ordem de COMPRA {} para {} (Qtd: {}) ENQUEUE. ID Interno: {}",
-                    action, symbol, quantity, nextOrderId);
             try {
-                if (quantity <= 0) {
-                    log.error("❌ [PONTE IBKR | ERRO DIMENSIONAL] Ordem rejeitada: Quantidade ({}) é inválida. A Ponte CANCELA para não prejudicar o que já existe.", quantity);
-                    return new OrderExecutionResult(false, "Quantidade dimensional inválida (zero ou negativa).");
-                }
+                if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");
 
-                // 🚨 VERIFICAÇÃO DE SEGURANÇA CONTRA O ERRO DIMENSIONAL DE LIQUIDEZ (Excess Liquidity)
+                // 🚨 VETO RIGOROSO: Compra proibida se liquidez for zero ou negativa.
                 if (!isExcessLiquiditySufficient()) {
-                    log.error("❌ [PONTE IBKR | ERRO LIQUIDEZ] Ordem rejeitada: Excess Liquidity (R$ {}) insuficiente para a operação. Modo de Resgate pode estar ativo.",
+                    log.error("🛑 [VETO COMPRA] Excess Liquidity insuficiente (R$ {}). Operação bloqueada.",
                             portfolioService.getExcessLiquidity().toPlainString());
-                    // 🛑 Retorna falha para forçar o tratamento no Principal (Modo de Resgate)
-                    return new OrderExecutionResult(false, "Excess Liquidity insuficiente. Ação vetada pela Ponte.");
+                    return new OrderExecutionResult(false, "Liquidez insuficiente para novas compras.");
                 }
 
+                log.info("🚀 [PONTE IBKR | EXEC] Enviando COMPRA de {}. ID: {}", symbol, nextOrderId);
                 Thread.sleep(50);
-                log.info("🔥 [PONTE IBKR | EXEC] Ordem {} para {} enviada à corretora. ID IBKR: {}", action, symbol, nextOrderId);
-                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada e confirmada na fila da IBKR.");
-                result.setOrderId(nextOrderId);
 
-                nextOrderId++;
+                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem de compra enviada.");
+                result.setOrderId(nextOrderId++);
                 return result;
             } catch (Exception e) {
-                log.error("❌ [PONTE IBKR | ERRO FATAL] Falha na comunicação ou Thread ao processar ordem para {}: {}", symbol, e.getMessage(), e);
-                return new OrderExecutionResult(false, "Erro interno de concorrência/comunicação na Ponte: " + e.getMessage());
+                log.error("❌ [ERRO FATAL] Falha na compra de {}: {}", symbol, e.getMessage());
+                return new OrderExecutionResult(false, e.getMessage());
             }
         }
     }
 
-    // ====================================================================
-    // 3. MÉTODOS DE VALIDAÇÃO DE LIQUIDEZ (Usando SSOT)
-    // ====================================================================
-
-    /**
-     * ✅ Implementa a lógica para verificar se o Excess Liquidity é suficiente.
-     * Retorna TRUE apenas se o valor for positivo, garantindo a liquidez mínima.
-     */
     private boolean isExcessLiquiditySufficient() {
-        // Obtém o valor real de Excess Liquidity do cache SSOT (LivePortfolioService)
-        BigDecimal excessLiquidity = portfolioService.getExcessLiquidity();
-        // A liquidez é considerada insuficiente se for ZERO ou NEGATIVA.
-        return excessLiquidity.compareTo(BigDecimal.ZERO) > 0;
+        // SSOT da Ponte
+        return portfolioService.getExcessLiquidity().signum() > 0;
     }
-
-    // O método 'getExcessLiquidity' fictício não é mais necessário aqui,
-    // pois a lógica real está no LivePortfolioService.
 }

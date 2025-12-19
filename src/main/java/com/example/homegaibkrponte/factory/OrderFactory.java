@@ -31,54 +31,64 @@ public class OrderFactory {
     /**
      * Cria um objeto Order nativo da IBKR a partir do nosso OrderDTO.
      */
+    /**
+     * ✅ AJUSTE DEFINITIVO: Criação de Ordem IBKR a partir do OrderDTO (Record).
+     * Resolve a falta do campo 'side' e a transição para 'type' como String.
+     */
     public Order create(OrderDTO dto, String ibkrClientOrderId) {
-        Order ibkrOrder = new Order();
+        com.ib.client.Order ibkrOrder = new com.ib.client.Order();
 
+        // 1. IDENTIFICAÇÃO E QUANTIDADE
         ibkrOrder.orderId(Integer.parseInt(ibkrClientOrderId));
-        ibkrOrder.totalQuantity(Decimal.get(dto.quantity()));
+        ibkrOrder.totalQuantity(com.ib.client.Decimal.get(dto.quantity()));
 
-        String actionString = dto.type().getSide();
+        // 2. RECUPERAÇÃO DO ENUM (Para extrair Side e Tipo IBKR)
+        OrderTypeEnum typeEnum = dto.getTypeAsEnum();
+        if (typeEnum == null) {
+            throw new IllegalStateException("Tipo de ordem inválido ou não reconhecido: " + dto.type());
+        }
+
+        // ✅ SINERGIA: O Side (BUY/SELL) é extraído do Enum mapeado internamente
+        String actionString = typeEnum.getSide();
         ibkrOrder.action(actionString);
 
-        com.ib.client.OrderType ibkrType = determineIbkrOrderType(dto.type());
-        ibkrOrder.orderType(ibkrType.name());
+        // 3. DETERMINAÇÃO DO TIPO DE ORDEM (MKT, LMT, STP)
+        com.ib.client.OrderType ibkrType = determineIbkrOrderType(typeEnum);
+        ibkrOrder.orderType(ibkrType);
 
-        if (ibkrType == OrderType.MKT) {
-            ibkrOrder.lmtPrice(PRICE_ZERO);
-            ibkrOrder.auxPrice(PRICE_ZERO);
-
-            // ✅ AJUSTE CRÍTICO: Sinaliza intenção de compensação direta para facilitar
-            // aceitação de ordens de fechamento em cenários de margem baixa.
+        // 4. LÓGICA DE PREÇOS (Resiliente a campos nulos)
+        if (ibkrType == com.ib.client.OrderType.MKT) {
+            ibkrOrder.lmtPrice(0);
+            ibkrOrder.auxPrice(0);
+            // Sinaliza intenção de compensação direta para facilitar aceitação em margem baixa
             ibkrOrder.clearingIntent("IB");
 
-        } else if (ibkrType == OrderType.LMT) {
-            double limitPrice = Optional.ofNullable(dto.takeProfitPrice())
-                    .or(() -> Optional.ofNullable(dto.limitPrice()))
+        } else if (ibkrType == com.ib.client.OrderType.LMT) {
+            double limitPrice = Optional.ofNullable(dto.limitPrice()) // Prioridade ao campo específico
+                    .or(() -> Optional.ofNullable(dto.takeProfitPrice()))
                     .or(() -> Optional.ofNullable(dto.price()))
                     .filter(p -> p.compareTo(BigDecimal.ZERO) > 0)
-                    .orElseThrow(() -> new IllegalStateException("Ordem LMT requer preço."))
+                    .orElseThrow(() -> new IllegalStateException("Ordem LMT requer preço válido."))
                     .doubleValue();
             ibkrOrder.lmtPrice(limitPrice);
         }
-        else if (ibkrType == OrderType.STP) {
+        else if (ibkrType == com.ib.client.OrderType.STP) {
             double stopPrice = Optional.ofNullable(dto.stopLossPrice())
                     .or(() -> Optional.ofNullable(dto.price()))
                     .filter(p -> p.compareTo(BigDecimal.ZERO) > 0)
-                    .orElseThrow(() -> new IllegalStateException("Ordem STOP requer preço."))
+                    .orElseThrow(() -> new IllegalStateException("Ordem STOP requer preço auxiliar."))
                     .doubleValue();
             ibkrOrder.auxPrice(stopPrice);
-            ibkrOrder.lmtPrice(PRICE_ZERO);
+            ibkrOrder.lmtPrice(0);
         }
 
+        // 5. CONFIGURAÇÕES PADRÃO E CONTA
         ibkrOrder.tif("GTC");
         ibkrOrder.outsideRth(true);
-
-        // Garante que a conta correta está sendo usada no envio
-        ibkrOrder.account(connector.getAccountId());
+        ibkrOrder.account(connector.getAccountId()); // Garante o envio para DUN652604
 
         return ibkrOrder;
     }
-
     /**
      * ✅ SINERGIA TOTAL: Resolve o conflito de tipagem e mapeia o Enum de INTENÇÃO (Principal)
      * para o tipo IBKR (Ponte/TWS).

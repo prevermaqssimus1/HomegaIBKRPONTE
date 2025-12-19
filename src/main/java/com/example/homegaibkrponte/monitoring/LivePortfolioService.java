@@ -44,18 +44,19 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
 
     private final AtomicReference<Portfolio> portfolioState = new AtomicReference<>();
     private final ApplicationEventPublisher eventPublisher;
-
     public record AccountBalance(BigDecimal value, LocalDateTime timestamp) {}
-
-    private final AtomicReference<AccountBalance> lastAccountBalance =
-            new AtomicReference<>(new AccountBalance(BigDecimal.ZERO, LocalDateTime.MIN));
-
-    private final AtomicReference<CountDownLatch> accountSyncLatch =
-            new AtomicReference<>(new CountDownLatch(1));
-
+    private final AtomicReference<AccountBalance> lastAccountBalance = new AtomicReference<>(new AccountBalance(BigDecimal.ZERO, LocalDateTime.MIN));
+    private final AtomicReference<CountDownLatch> accountSyncLatch = new AtomicReference<>(new CountDownLatch(1));
     private final AtomicBoolean isSynced = new AtomicBoolean(false);
-
     private volatile CountDownLatch positionSyncLatch = new CountDownLatch(1);
+    private final Map<String, BigDecimal> flightOrders = new ConcurrentHashMap<>();
+
+    private final AtomicReference<BigDecimal> nlv = new AtomicReference<>(BigDecimal.ZERO);
+    private final AtomicReference<BigDecimal> cash = new AtomicReference<>(BigDecimal.ZERO);
+    private final AtomicReference<BigDecimal> bp = new AtomicReference<>(BigDecimal.ZERO);
+    private final AtomicReference<BigDecimal> el = new AtomicReference<>(BigDecimal.ZERO);
+
+
 
     // 🛑 CONTROLE DE MARGEM CRÍTICA (Ciclo de Dependência Circular)
     private final CountDownLatch criticalMarginDataLatch = new CountDownLatch(1);
@@ -114,6 +115,112 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         );
         this.portfolioState.set(initialPortfolio);
         log.warn("🔄 Portfólio LIVE inicializado com capital PADRÃO. Aguardando sincronização... Capital: R$ {}", initialCapital);
+    }
+
+    public BigDecimal getTotalCostOfPendingOrders() {
+        return flightOrders.values().stream()
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    public void trackOrderSent(String clientOrderId, BigDecimal quantity, BigDecimal price) {
+        try {
+            BigDecimal estimatedCost = quantity.abs().multiply(price);
+            flightOrders.put(clientOrderId, estimatedCost);
+
+            log.info("📝 [TRACKING] Capital Reservado: {} | Custo Est: R$ {} | Pendentes: {}",
+                    clientOrderId, estimatedCost.setScale(2, RoundingMode.HALF_UP), flightOrders.size());
+
+            // Força a atualização do BP ajustado no snapshot
+            BigDecimal currentBP = accountValuesCache.getOrDefault(KEY_BUYING_POWER, BigDecimal.ZERO);
+            handleBuyingPowerUpdate(currentBP);
+
+        } catch (Exception e) {
+            log.error("❌ Erro ao rastrear ordem {} no Portfólio: {}", clientOrderId, e.getMessage());
+        }
+    }
+
+    public void removePendingOrder(String clientOrderId) {
+        if (clientOrderId != null && flightOrders.remove(clientOrderId) != null) {
+            log.debug("🧹 [TRACKING] Ordem {} removida do rastreamento (Finalizada).", clientOrderId);
+        }
+    }
+
+    public AccountLiquidityDTO getStreamingLiquidityStatus() {
+        // Buscamos os valores dos AtomicReferences
+        BigDecimal currentNlv = nlv.get();
+        BigDecimal currentCash = cash.get();
+        BigDecimal currentBp = bp.get();
+        BigDecimal currentEl = el.get();
+
+        // Buscamos MMR e IMR do cache SSOT que você já possui na classe
+        BigDecimal maintainMargin = getMaintMarginRequirement();
+        BigDecimal initialMargin = getInitialMarginRequirement();
+
+        return new AccountLiquidityDTO(
+                currentNlv,
+                currentCash,
+                currentBp,
+                currentEl,
+                maintainMargin,
+                initialMargin
+        );
+    }
+
+    public BigDecimal getMarginUtilization() {
+        try {
+            BigDecimal currentNlv = getNetLiquidationValue();
+            BigDecimal maintMargin = getMaintMarginRequirement();
+
+            if (currentNlv.compareTo(BigDecimal.ZERO) <= 0) return BigDecimal.ONE;
+            return maintMargin.divide(currentNlv, 4, RoundingMode.HALF_UP);
+        } catch (Exception e) {
+            log.error("❌ Falha no cálculo de utilização de margem: {}", e.getMessage());
+            return BigDecimal.ONE;
+        }
+    }
+
+    /**
+     * 🌉 FUNÇÃO DE PONTE: Fornece o preço atual (Market Price) com cadeia de fallback robusta.
+     * Essencial para o cálculo de exposição e reserva de Buying Power.
+     */
+    public java.util.function.Function<String, BigDecimal> getMarketDataProvider() {
+        return symbol -> {
+            try {
+                // 1. Prioridade: Preço em tempo real do cache SSOT
+                BigDecimal currentPrice = accountValuesCache.getOrDefault(symbol.toUpperCase() + "_PRICE", BigDecimal.ZERO);
+
+                if (currentPrice.compareTo(BigDecimal.ZERO) > 0) {
+                    return currentPrice;
+                }
+
+                // 2. Fallback: Preço Médio de Entrada (Se houver posição aberta)
+                BigDecimal avgPrice = getPositionAveragePrice(symbol);
+                if (avgPrice.compareTo(BigDecimal.ZERO) > 0) {
+                    log.warn("⚠️ [PREÇO FALLBACK] Preço indisponível para {}. Usando Preço Médio: R$ {}",
+                            symbol, avgPrice.toPlainString());
+                    return avgPrice;
+                }
+
+                log.error("❌ [MARKET DATA ERROR] Sem preço disponível para {}.", symbol);
+                return BigDecimal.ZERO;
+
+            } catch (Exception e) {
+                log.error("❌ ERRO CRÍTICO no MarketDataProvider para {}: {}", symbol, e.getMessage());
+                return BigDecimal.ZERO;
+            }
+        };
+    }
+    /**
+     * Método auxiliar para buscar o preço médio de uma posição no snapshot.
+     */
+    private BigDecimal getPositionAveragePrice(String symbol) {
+        try {
+            return getPosition(symbol)
+                    .map(com.example.homegaibkrponte.model.Position::getAverageEntryPrice)
+                    .orElse(BigDecimal.ZERO);
+        } catch (Exception e) {
+            return BigDecimal.ZERO;
+        }
     }
 
     // ==========================================================
@@ -215,66 +322,69 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         return isCriticalMarginDataLoaded.get();
     }
 
-    /**
-     * 🌉 SINK: Recebe valores brutos da conta IBKR (BuyingPower, ExcessLiquidity, etc.).
-     * Este é o PONTO CENTRAL (SSOT) para todos os valores de conta em formato BigDecimal.
-     */
     public void updateAccountValue(String key, BigDecimal value) {
         try {
-            // Normaliza a chave recebida para UPPERCASE, garantindo consistência no cache SSOT.
             String normalizedKey = key.toUpperCase();
             accountValuesCache.put(normalizedKey, value);
-            log.debug("📊 [CACHE PONTE] Valor Bruto Sincronizado: {} = R$ {}", normalizedKey, value.toPlainString());
+            log.debug("📊 [CACHE PONTE] Valor Sincronizado: {} = R$ {}", normalizedKey, value.toPlainString());
 
+            switch (normalizedKey) {
+                case "NETLIQUIDATION", "NETLIQUIDATIONVALUE", "EQUITYWITHLOANVALUE" -> nlv.set(value);
+                case "CASHBALANCE" -> cash.set(value);
+                case "BUYINGPOWER" -> bp.set(value);
+                case "EXCESSLIQUIDITY", "AVAILABLEFUNDS" -> {
+                    el.set(value);
+                    excessLiquidityCache.set(value);
+                }
+            }
+
+            // Se for Buying Power, atualizar o snapshot do portfólio descontando as pendentes
             if (KEY_BUYING_POWER_NORMALIZED.equalsIgnoreCase(normalizedKey)) {
-                LocalDateTime now = LocalDateTime.now();
-                CountDownLatch latch = accountSyncLatch.get();
-
-                lastAccountBalance.set(new AccountBalance(value, now));
-                portfolioState.getAndUpdate(current -> current.toBuilder()
-                        .cashBalance(value)
-                        .build()
-                );
-
-                if (latch != null && latch.getCount() > 0) {
-                    latch.countDown();
-                    log.info("✅ Latch de sincronização de saldo disparado (countDown).");
-                }
-
-                if (isSynced.compareAndSet(false, true)) {
-                    log.warn("✅ PRIMEIRA SINCRONIZAÇÃO DE SALDO COMPLETA! Poder de Compra: R$ {}. Sistema operacional.", value);
-                } else {
-                    log.info("Sincronização de saldo contínua. Poder de Compra atualizado: R$ {}", value.toPlainString());
-                }
+                handleBuyingPowerUpdate(value);
             }
 
-            if (KEY_EXCESS_LIQUIDITY_NORMALIZED.equalsIgnoreCase(normalizedKey)) {
-
-                BigDecimal oldEL = excessLiquidityCache.get();
-                BigDecimal newEL = value;
-
-                excessLiquidityCache.set(newEL);
-
-                log.warn("💰 [CACHE PONTE | EXCESS_LIQUIDITY_SSOT] Valor SSOT Atualizado: R$ {} (Anterior: R$ {})",
-                        newEL.toPlainString(), oldEL.toPlainString());
-
-                if (oldEL.compareTo(BigDecimal.ZERO) == 0 && newEL.compareTo(BigDecimal.ZERO) > 0) {
-                    log.info("🎉 [EL-RECOVERY] Excess Liquidity recuperado: R$ {} (era R$ {})", newEL.toPlainString(), oldEL.toPlainString());
-                } else if (newEL.compareTo(BigDecimal.ZERO) == 0 && oldEL.compareTo(BigDecimal.ZERO) > 0) {
-                    log.error("🚨 [EL-ZEROED] Excess Liquidity zerado! ATENÇÃO: Disparar validação de margem crítica. Era R$ {}, agora R$ {}", oldEL.toPlainString(), newEL.toPlainString());
-                }
-
-                validateExcessLiquidity();
-            }
-
-            // 🛑 Checa e sinaliza a prontidão dos dados críticos de margem após qualquer atualização de valor
             checkAndSignalCriticalMarginReadiness();
 
         } catch (Exception e) {
-            log.error("❌ ERRO CRÍTICO no updateAccountValue. Falha ao processar a chave {}: {}", key, e.getMessage(), e);
+            log.error("❌ ERRO no updateAccountValue da Ponte: {}", e.getMessage());
         }
     }
 
+    /**
+     * ✅ AJUSTE DE SINERGIA: Atualiza o saldo considerando ordens em voo.
+     * O Buying Power real é o valor da corretora MENOS o custo das ordens pendentes.
+     */
+    private void handleBuyingPowerUpdate(BigDecimal value) {
+        try {
+            LocalDateTime now = LocalDateTime.now();
+
+            // 🛡️ SINERGIA: Deduz o custo das ordens que acabamos de enviar (Passo 1)
+            BigDecimal pendingCost = getTotalCostOfPendingOrders();
+            BigDecimal adjustedBP = value.subtract(pendingCost);
+
+            lastAccountBalance.set(new AccountBalance(adjustedBP, now));
+
+            // Atualiza o snapshot atômico para que o SizingService do Principal leia o valor correto
+            portfolioState.getAndUpdate(current -> current.toBuilder()
+                    .cashBalance(adjustedBP)
+                    .build());
+
+            // Liberação de travas de inicialização
+            CountDownLatch latch = accountSyncLatch.get();
+            if (latch != null && latch.getCount() > 0) {
+                latch.countDown();
+            }
+
+            if (isSynced.compareAndSet(false, true)) {
+                log.warn("✅ PRIMEIRA SINCRONIZAÇÃO DE SALDO! Corretora: R$ {} | Pendente: R$ {} | Ajustado: R$ {}",
+                        value, pendingCost, adjustedBP);
+            } else {
+                log.debug("📊 [BP SYNC] BP Corretora: R$ {} | Ajustado: R$ {}", value, adjustedBP);
+            }
+        } catch (Exception e) {
+            log.error("❌ Erro ao processar atualização de Buying Power: {}", e.getMessage());
+        }
+    }
     /**
      * **MÉTODO DE PRONTIDÃO**
      * Checa se os valores críticos de margem foram recebidos e, se sim, libera o Latch de sincronização.
@@ -320,56 +430,46 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
      * ✅ [SSOT] Retorna o status completo de liquidez da conta (NLV, Cash, BP) do cache local.
      */
     public AccountLiquidityDTO getFullLiquidityStatus() {
-
         try {
-            BigDecimal netLiquidationValue = getNetLiquidationValue();
-            // Usa a chave UPPERCASE consistente
-            BigDecimal cashBalance = accountValuesCache.getOrDefault(KEY_CASH_BALANCE, BigDecimal.ZERO);
-            BigDecimal excessLiquidity = getExcessLiquidity();
-            // Usa a chave UPPERCASE consistente
-            BigDecimal availableFunds = accountValuesCache.getOrDefault(KEY_AVAILABLE_FUNDS, BigDecimal.ZERO);
+            // Prioridade 1: Valor da variável atómica 'nlv' (Já sincronizada com EquityWithLoan)
+            // Prioridade 2: Fallback para o cache de mapa
+            BigDecimal netLiquidationValue = nlv.get().compareTo(BigDecimal.ZERO) > 0
+                    ? nlv.get()
+                    : accountValuesCache.getOrDefault(KEY_NET_LIQUIDATION, BigDecimal.ZERO);
 
-            BigDecimal maintainMarginReq = getMaintMarginRequirement(); // MMR
-            BigDecimal initMarginReq = getInitialMarginRequirement();   // IMR
+            BigDecimal cashBalance = cash.get().compareTo(BigDecimal.ZERO) > 0
+                    ? cash.get()
+                    : accountValuesCache.getOrDefault(KEY_CASH_BALANCE, BigDecimal.ZERO);
 
-            BigDecimal currentBuyingPower;
+            BigDecimal excessLiquidity = el.get().compareTo(BigDecimal.ZERO) > 0
+                    ? el.get()
+                    : accountValuesCache.getOrDefault(KEY_EXCESS_LIQUIDITY, BigDecimal.ZERO);
 
-
-
-            if (excessLiquidity.compareTo(BigDecimal.ZERO) > 0) {
-                currentBuyingPower = excessLiquidity;
-                log.debug("💰 [PONTE | BP FLUXO] Usando Excess Liquidity (EL: R$ {}) como Buying Power de referência.", currentBuyingPower.toPlainString());
-            } else if (availableFunds.compareTo(BigDecimal.ZERO) > 0) {
-                currentBuyingPower = availableFunds;
-                log.warn("⚠️ [PONTE | BP FLUXO] EL ausente/zero. Usando Available Funds (AF: R$ {}) como substituto.", currentBuyingPower.toPlainString());
-            } else {
-                currentBuyingPower = BigDecimal.ZERO;
-                log.error("❌ [PONTE | BP FLUXO] Liquidez (EL/AF) zerada. Retornando R$ 0.00 para forçar VETO de Emergência no Principal.");
-            }
+            BigDecimal currentBuyingPower = bp.get().compareTo(BigDecimal.ZERO) > 0
+                    ? bp.get()
+                    : (excessLiquidity.compareTo(BigDecimal.ZERO) > 0 ? excessLiquidity : BigDecimal.ZERO);
 
             AccountLiquidityDTO liquidityDTO = new AccountLiquidityDTO(
                     netLiquidationValue,
                     cashBalance,
                     currentBuyingPower,
                     excessLiquidity,
-                    // ✅ NOVOS CAMPOS ENVIADOS AO PRINCIPAL
-                    maintainMarginReq,
-                    initMarginReq
+                    getMaintMarginRequirement(),
+                    getInitialMarginRequirement()
             );
 
-            log.info("✅ [PONTE | DTO SSOT] DTO de Liquidez Enviado. NLV: R$ {}, Cash: R$ {}, BP Retornado: R$ {}, EL: R$ {}",
-                    liquidityDTO.getNetLiquidationValue().toPlainString(),
-                    liquidityDTO.getCashBalance().toPlainString(),
-                    liquidityDTO.getCurrentBuyingPower().toPlainString(),
-                    liquidityDTO.getExcessLiquidity().toPlainString()
-            );
+//            log.info("✅ [PONTE | RT-SYNC] DTO Gerado -> NLV: R$ {} | BP: R$ {} | EL: R$ {}",
+//                    liquidityDTO.getNetLiquidationValue().toPlainString(),
+//                    liquidityDTO.getCurrentBuyingPower().toPlainString(),
+//                    liquidityDTO.getExcessLiquidity().toPlainString()
+//            );
 
             return liquidityDTO;
 
         } catch (Exception e) {
-            log.error("❌ ERRO CRÍTICO ao gerar AccountLiquidityDTO. Retornando DTO zerado.", e);
-            // Assumindo que AccountLiquidityDTO tem construtor com 4 BigDecimal
-            return new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);        }
+            log.error("❌ ERRO ao gerar AccountLiquidityDTO: {}", e.getMessage());
+            return new AccountLiquidityDTO(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+        }
     }
 
     // =========================================================================
@@ -440,6 +540,37 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         return el;
     }
 
+    public void updateFromBroker(String key, String value) {
+        try {
+            if (value == null || value.isEmpty()) return;
+            BigDecimal val = new BigDecimal(value);
+
+            switch (key) {
+                case "NetLiquidation" -> nlv.set(val);
+                case "CashBalance" -> cash.set(val);
+                case "BuyingPower" -> bp.set(val);
+                case "ExcessLiquidity" -> {
+                    el.set(val);
+                    // Log de nível DEBUG para acompanhar o streaming sem poluir o log INFO
+                    log.debug("⚡ [STREAMING] EL atualizado no Cache: R$ {}", val);
+                }
+            }
+        } catch (Exception e) {
+            log.error("❌ Erro ao processar tag de conta: {} = {}", key, value);
+        }
+    }
+
+    public AccountLiquidityDTO getStreamingLiquidity() {
+        return new AccountLiquidityDTO(
+                nlv.get(),
+                cash.get(),
+                bp.get(),
+                el.get(),
+                BigDecimal.ZERO, // MaintMargin (Opcional no Streaming)
+                BigDecimal.ZERO  // InitMargin (Opcional no Streaming)
+        );
+    }
+
     /**
      * Retorna o valor bruto do Buying Power do cache local.
      */
@@ -452,14 +583,12 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
      * Retorna o Net Liquidation Value (PL) do cache SSOT da Ponte.
      */
     public BigDecimal getNetLiquidationValue() {
-        try {
-            BigDecimal nlv = accountValuesCache.getOrDefault(KEY_NET_LIQUIDATION_NORMALIZED, BigDecimal.ZERO);
-            log.debug("💰 [PONTE | SSOT PL] Retornando Net Liquidation Value (PL) do cache: R$ {}", nlv.toPlainString());
-            return nlv;
-        } catch (Exception e) {
-            log.error("❌ [PONTE | ERRO SSOT] Falha ao obter Net Liquidation Value do cache. Retornando Zero.", e);
-            return BigDecimal.ZERO;
-        }
+        // Tenta primeiro a variável atómica sincronizada
+        if (nlv.get().compareTo(BigDecimal.ZERO) > 0) return nlv.get();
+
+        // Fallback para o cache de mapa usando as chaves normalizadas
+        return accountValuesCache.getOrDefault("NETLIQUIDATION",
+                accountValuesCache.getOrDefault("EQUITYWITHLOANVALUE", BigDecimal.ZERO));
     }
 
     // --- MÉTODOS DE ACESSO Específicos para Margem (USAM AS NOVAS CONSTANTES UPPERCASE) ---
@@ -759,4 +888,8 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         return accountValuesCache;
     }
 
+    public BigDecimal getNlv() { return nlv.get(); }
+    public BigDecimal getCash() { return cash.get(); }
+    public BigDecimal getBp() { return bp.get(); }
+    public BigDecimal getEl() { return el.get(); }
 }

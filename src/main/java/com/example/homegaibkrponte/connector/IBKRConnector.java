@@ -12,6 +12,7 @@ import com.example.homegaibkrponte.model.PositionDTO;
 import com.example.homegaibkrponte.model.TradeExecutedEvent;
 import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import com.example.homegaibkrponte.properties.IBKRProperties;
+import com.ib.client.Decimal;
 
 // Adicionado para SINERGIA com o Principal
 import com.example.homegaibkrponte.service.IBKRConnectorInterface;
@@ -63,17 +64,18 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private final AtomicInteger currentAccountSummaryReqId = new AtomicInteger(-1);
     private final ConcurrentMap<Integer, CompletableFuture<OrderStateDTO>> whatIfFutures = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, BigDecimal> marketPriceCache = new ConcurrentHashMap<>();
-
+    private final ConcurrentHashMap<Integer, com.ib.client.Order> lastOrdersCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, com.ib.client.Contract> lastContractsCache = new ConcurrentHashMap<>();
     private final OrderIdManager orderIdManager;
     private final IBKRMapper ibkrMapper;
-
+    private String lastWhatIfEl = "0.0";
     private EClientSocket client;
     private EReaderSignal readerSignal;
     private final AtomicInteger nextValidId = new AtomicInteger(1);
     private final ConcurrentHashMap<Integer, CompletableFuture<List<Candle>>> pendingHistoricalData = new ConcurrentHashMap<>();
     private final CountDownLatch connectionLatch = new CountDownLatch(1);
     private static final int CRITICAL_MARGIN_REQ_ID = 9001;
-
+    private final Map<String, Integer> recoveryAttempts = new ConcurrentHashMap<>();
     // ✅ CAMPO SINÉRGICO: Listener de Callback para o Principal
     private Optional<BPSyncedListener> bpListener = Optional.empty();
 
@@ -127,17 +129,207 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         return Optional.ofNullable(marketPriceCache.get(symbol.toUpperCase()));
     }
 
+    public String getLastWhatIfExcessLiquidity() {
+        return this.lastWhatIfEl;
+    }
 
+
+    /**
+     * 🚀 MÉTODO CENTRAL DE ENVIO (Garante o Passo 1)
+     * TODA submissão de ordem deve passar por aqui para alimentar o cache de recuperação.
+     */
+    /**
+     * 🚀 ENVIO FÍSICO PARA TWS: Ponto final de execução na Ponte.
+     * Ajustado para garantir Sinergia de Capital (Flight Orders) e Cache de Recuperação.
+     */
     public void placeOrder(int orderId, Contract contract, com.ib.client.Order order) {
-        if (isConnected()) {
-            // Chama a funcionalidade nativa do TWS API
-            client.placeOrder(orderId, contract, order);
-            log.info("📦 [TWS-OUT] Ordem {} enviada para o TWS/Gateway.", orderId);
-        } else {
-            log.error("❌ [TWS-OUT] Falha ao enviar ordem {}: Conexão IBKR inativa.", orderId);
-            throw new IllegalStateException("Conexão IBKR inativa. Não foi possível enviar a ordem.");
+        try {
+            if (isConnected()) {
+                // 1. 🚨 REGISTRO NO CACHE DE RECUPERAÇÃO (Para suportar o Erro 201)
+                lastOrdersCache.put(orderId, order);
+                lastContractsCache.put(orderId, contract);
+
+                // 2. 🛡️ SINERGIA DE CAPITAL: Reserva o capital no LivePortfolioService (Flight Orders)
+                // Isso impede que o SizingService use o mesmo dinheiro enquanto a ordem não for confirmada. [cite: 450, 451]
+                BigDecimal quantity = new BigDecimal(order.totalQuantity().value().toString());
+                // Para ordens MARKET, usamos o preço de referência ou último preço conhecido
+                BigDecimal price = order.lmtPrice() != 0 ? BigDecimal.valueOf(order.lmtPrice()) :
+                        portfolioService.getMarketDataProvider().apply(contract.symbol());
+
+                portfolioService.trackOrderSent(String.valueOf(orderId), quantity, price);
+
+                log.info("📦 [TWS-OUT] Ordem {} registrada no cache e capital reservado. Ativo: {} | Qtd: {}",
+                        orderId, contract.symbol(), quantity);
+
+                // 3. ENVIO FÍSICO VIA SOCKET
+                this.client.placeOrder(orderId, contract, order);
+
+                log.info("✅ [TWS-OUT] Ordem {} transmitida à IBKR com sucesso.", orderId);
+            } else {
+                log.error("❌ [TWS-OUT] Conexão inativa. Falha ao enviar ordem {}.", orderId);
+                // Notifica o Principal sobre a falha de conexão imediata
+                webhookNotifier.sendOrderRejection(orderId, -1, "Conexão Inativa com Gateway/TWS");
+            }
+        } catch (Exception e) {
+            log.error("💥 [TWS-OUT] Erro crítico no placeOrder: {}", e.getMessage(), e);
+
+            // LIMPEZA DE SEGURANÇA IMEDIATA EM CASO DE EXCEÇÃO
+            lastOrdersCache.remove(orderId);
+            lastContractsCache.remove(orderId);
+            portfolioService.removePendingOrder(String.valueOf(orderId));
         }
     }
+
+    /**
+     * Lógica central para reduzir a ordem após rejeição de margem (Erro 201).
+     */
+    /**
+     * 🔄 PROTOCOLO DE RECUPERAÇÃO SMART (PASSO 2)
+     * Reduz o lote agressivamente em 40% para tentar encaixar na Margem Inicial disponível.
+     * Interrompe o ciclo após 2 tentativas para proteger a sustentabilidade da conta.
+     */
+    /**
+     * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (PASSO 2 AJUSTADO)
+     * Reduz o lote sucessivamente até atingir 1 unidade.
+     * ✅ Sustentabilidade: Implementa Cooldown para evitar bloqueio de API (Spam).
+     * ✅ Resiliência: Tenta esgotar todas as possibilidades de margem inicial.
+     */
+    /**
+     * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (Ajustado para Sustentabilidade)
+     * Reduz o lote sucessivamente até 1 unidade, respeitando a saúde da conta.
+     */
+    private void tentarReenvioComReducao(int originalId, com.ib.client.Contract contract, com.ib.client.Order order) {
+        String symbol = contract.symbol();
+        try {
+            // 1. 🛡️ COOLDOWN OBRIGATÓRIO: Evita sobrecarga no processador de mensagens e spam na IBKR
+            // Dá tempo para a TWS atualizar os valores de margem após a rejeição anterior.
+            Thread.sleep(500);
+
+            double qtdAtual = order.totalQuantity().value().doubleValue();
+
+            // 2. Cálculo da nova quantidade com redução de 40% (AMC - Adaptive Margin Control)
+            double novaQtd = Math.floor(qtdAtual * 0.60);
+
+            // Garante a tentativa final com o lote mínimo de 1 ação
+            if (novaQtd < 1 && qtdAtual > 1) {
+                novaQtd = 1;
+            }
+
+            if (novaQtd >= 1 && novaQtd < qtdAtual) {
+                // 3. 🛡️ VETO POR LIQUIDEZ EXTREMA: Interrompe o loop se o EL for negativo
+                // Isso impede que o sistema tente "espremer" ordens em uma conta já insolvente.
+                if (portfolioService.getExcessLiquidity().signum() < 0) {
+                    log.error("🛑 [RECOVERY STOP] Excess Liquidity Negativo (R$ {}). Abortando reduções para {}.",
+                            portfolioService.getExcessLiquidity().toPlainString(), symbol);
+                    return;
+                }
+
+                log.warn("🔄 [RECOVERY EXAUSTIVO] Ajustando {} de {} para {} unidades por falta de margem.",
+                        symbol, qtdAtual, novaQtd);
+
+                // 4. Atualiza a ordem com a nova quantidade
+                order.totalQuantity(com.ib.client.Decimal.get(novaQtd));
+
+                // 5. Gera um NOVO ID único para evitar o erro "Duplicate Order ID" (Código 103)
+                int novoId = orderIdManager.getNextOrderId();
+
+                // 6. Reenvia pelo placeOrder centralizado (Garante registro no cache e Flight Orders)
+                this.placeOrder(novoId, contract, order);
+
+            } else {
+                log.error("🛑 [RECOVERY FATAL] Limite mínimo de 1 unidade atingido para {} sem sucesso na corretora.", symbol);
+                // Notifica o Principal sobre o esgotamento das tentativas via Webhook
+                webhookNotifier.sendOrderRejection(originalId, 201, "Recovery esgotado: impossível executar mesmo com 1 unidade.");
+            }
+        } catch (InterruptedException e) {
+            log.error("❌ [RECOVERY] Thread interrompida durante o Cooldown.");
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            log.error("💥 [RECOVERY] Erro crítico no protocolo de redução para {}: {}", symbol, e.getMessage());
+        }
+    }
+
+    /**
+     * ✅ ETAPA 1: Ativa a "torneira" de dados.
+     * Chame este método uma única vez após a conexão ser estabelecida.
+     */
+    public void startStreaming() {
+        String accId = this.getAccountId(); // Ou a variável que guarda seu DUN...
+        if (this.getClient() != null && isConnected()) {
+            log.info("🚀 [PONTE | STREAMING] Ativando subscrição contínua para conta: {}", accId);
+
+            // 'true' mantém a subscrição aberta. A TWS enviará dados sempre que houver mudança.
+            this.getClient().reqAccountUpdates(true, accId);
+        } else {
+            log.error("❌ [PONTE] Falha ao iniciar streaming: Cliente não conectado.");
+        }
+    }
+
+    /**
+     * Realiza uma simulação preventiva de margem antes do envio real.
+     */
+    public boolean validarMargemPreventiva(Contract contract, Order order) {
+        int reqId = order.orderId();
+        try {
+            log.info("🔍 [PRE-CHECK] Iniciando simulação What-If para {} (ID: {})", contract.symbol(), reqId);
+
+            order.whatIf(true);
+            CompletableFuture<com.example.homegaibkrponte.model.OrderStateDTO> future = new CompletableFuture<>();
+            whatIfFutures.put(reqId, future);
+
+            client.placeOrder(reqId, contract, order);
+
+            // Aguarda a resposta (3 segundos de timeout para sinergia)
+            com.example.homegaibkrponte.model.OrderStateDTO res = future.get(3, TimeUnit.SECONDS);
+
+            if (res != null) {
+                // 📊 LOG DE COMPROVAÇÃO TÉCNICA (Usando seus campos de 'Change' e 'After')
+                log.info("📊 [WHAT-IF TELEMETRIA] Ativo: {} | Mudança Margem Inicial: {} | EL Projetado (After): {}",
+                        contract.symbol(), res.getInitMarginChange(), res.getExcessLiquidityAfter());
+
+                // A lógica de decisão baseada no seu campo excessLiquidityAfter
+                double elProjetado = Double.parseDouble(res.getExcessLiquidityAfter());
+
+                if (elProjetado <= 0) {
+                    log.warn("⚠️ [VETO PREVENTIVO] Simulação REPROVADA. EL projetado de {} é insuficiente.", elProjetado);
+                    return false;
+                }
+
+                log.info("✅ [APROVAÇÃO PREVENTIVA] Margem validada. Prosseguindo com envio real.");
+                return true;
+            }
+            return false;
+        } catch (Exception e) {
+            log.error("❌ [WHAT-IF FALHA] Erro ao processar telemetria para {}: {}", contract.symbol(), e.getMessage());
+            return false;
+        } finally {
+            order.whatIf(false);
+            whatIfFutures.remove(reqId);
+        }
+    }
+
+    public void enviarOrdemComPrevecao(com.example.homegaibkrponte.model.Order ordemPrincipal) {
+        try {
+            com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
+            com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
+
+            // 1. Tenta validar antes de enviar
+            boolean margemOk = validarMargemPreventiva(contract, ibkrOrder);
+
+            if (margemOk) {
+                // 2. Se OK, envia a ordem real
+                this.placeOrder(ibkrOrder.orderId(), contract, ibkrOrder);
+            } else {
+                // 3. Se falhar, chama a nossa lógica de redução (Fase 1) antes mesmo da rejeição 201 ocorrer
+                log.warn("🔄 [PREVENÇÃO] Margem insuficiente no What-If. Iniciando redução preventiva...");
+                tentarReenvioComReducao(ibkrOrder.orderId(), contract, ibkrOrder);
+            }
+
+        } catch (Exception e) {
+            log.error("❌ Erro no fluxo de envio preventivo: ", e);
+        }
+    }
+
 
     @Override
     public void enviarOrdemDeVenda(SinalVenda venda) {
@@ -242,10 +434,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
                 CRITICAL_MARGIN_REQ_ID, tags);
     }
 
-    /**
-     * Envia a ordem principal para a Ponte IBKR.
-     * @param ordemPrincipal Ordem a ser enviada.
-     */
     public void enviarOrdem(com.example.homegaibkrponte.model.Order ordemPrincipal) throws MarginRejectionException, OrdemFalhouException {
         try {
             // 1. Uso dos Mappers (SINERGIA)
@@ -254,13 +442,14 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
             int orderId = ibkrOrder.orderId();
 
-            // 2. Uso do twsClient
+            // 2. Uso do método local placeOrder (IMPORTANTE: Não usar o client.placeOrder direto)
             log.info("➡️➡️➡️ [Ponte IBKR] Enviando ordem ID: {} | Ação: {} | Tipo: {} | Símbolo: {}",
                     orderId, ibkrOrder.action(), ibkrOrder.orderType(), contract.symbol());
 
-            client.placeOrder(orderId, contract, ibkrOrder);
+            // ✅ CORREÇÃO CRÍTICA: Chama 'this.placeOrder' para garantir que a ordem entre no cache lastOrdersCache
+            this.placeOrder(orderId, contract, ibkrOrder);
 
-            log.info("✅ [Ponte IBKR] Ordem ID: {} enviada com sucesso.", orderId);
+            log.info("✅ [Ponte IBKR] Ordem ID: {} enviada e registrada no cache com sucesso.", orderId);
 
         } catch (Exception e) {
             String errorMessage = e.getMessage();
@@ -269,7 +458,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             if (errorMessage != null && errorMessage.contains("201")) {
                 log.error("❌🚨 [Ponte IBKR | ERRO 201 MARGEM] Ordem {} rejeitada (Margem). Mensagem: {}",
                         ordemPrincipal.symbol(), errorMessage, e);
-                // Lança a exceção de domínio para o Principal (WebClient) capturar e ativar o Resgate.
                 throw new MarginRejectionException("Ordem rejeitada pela Corretora (IBKR Error 201). Liquidez não liberada.", e);
             }
 
@@ -277,7 +465,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             throw new OrdemFalhouException("Falha na execução da ordem na Ponte IBKR.", e);
         }
     }
-
 
     @Deprecated
     public MarginWhatIfResponseDTO requestMarginWhatIf(String symbol, int quantity) {
@@ -361,36 +548,36 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
     @Override
     public void openOrder(int orderId, Contract contract, Order order, OrderState orderState) {
-        try {
-            // Verifica se o ID de ordem está no mapa de Futures de What-If pendentes.
-            if (order.whatIf() && whatIfFutures.containsKey(orderId)) {
+        log.info("ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ℹ️️️ [OPEN-ORDER] ID: {} | Ativo: {} | Status: {}", orderId, contract.symbol(), orderState.status());
 
-                // 1. É uma resposta What-If. Captura e remove o Future pendente.
-                CompletableFuture<OrderStateDTO> future = whatIfFutures.remove(orderId);
+        CompletableFuture<com.example.homegaibkrponte.model.OrderStateDTO> future = whatIfFutures.get(orderId);
+        if (future != null) {
+            com.example.homegaibkrponte.model.OrderStateDTO dto = new com.example.homegaibkrponte.model.OrderStateDTO();
+            dto.setStatus(String.valueOf(orderState.status()));
+            dto.setInitMarginBefore(orderState.initMarginBefore());
+            dto.setMaintMarginBefore(orderState.maintMarginBefore());
+            dto.setEquityWithLoanBefore(orderState.equityWithLoanBefore());
 
-                // --- SINERGIA: Mapeia para os campos existentes ---
-                String marginChange = orderState.initMarginChange();
-                String equityAfter = orderState.equityWithLoanAfter();
+            // Populando seus campos de 'Change'
+            dto.setInitMarginChange(orderState.initMarginChange());
+            dto.setMaintMarginChange(orderState.maintMarginChange());
+            dto.setEquityWithLoanChange(orderState.equityWithLoanChange());
 
-                log.info("📢 [PONTE | TWS-IN | What-If] Resultado REAL recebido. Simulação What-If para {}.", contract.symbol());
-                log.info("ℹ️ [PONTE | TWS-IN | What-If] Impacto na Margem Inicial (Change): {}", marginChange);
-                log.info("ℹ️ [PONTE | TWS-IN | What-If] Patrimônio/Liquidez Pós-Simulação (Equity After): {}", equityAfter);
+            // Populando seus campos de 'After'
+            dto.setInitMarginAfter(orderState.initMarginAfter());
+            dto.setMaintMarginAfter(orderState.maintMarginAfter());
+            dto.setEquityWithLoanAfter(orderState.equityWithLoanAfter());
 
-                // 2. Cria o DTO de estado com os valores reais mapeados
-                OrderStateDTO resolvedState = ibkrMapper.toOrderStateDTO(orderState);
-
-                // 3. Resolve a Promise com o estado completo.
-                future.complete(resolvedState);
-
-                return; // Termina o processamento para este What-If
+            // 🚨 CAMPO CHAVE PARA O SEU MODELO
+            // Nota: se a API da IBKR não retornar excessLiquidityAfter direto no orderState,
+            // o cálculo é (EquityWithLoanAfter - MaintMarginAfter)
+            if (orderState.equityWithLoanAfter() != null && orderState.maintMarginAfter() != null) {
+                double calculatedEL = Double.parseDouble(orderState.equityWithLoanAfter()) - Double.parseDouble(orderState.maintMarginAfter());
+                dto.setExcessLiquidityAfter(String.valueOf(calculatedEL));
             }
 
-            // --- Lógica para ordens normais (mantida) ---
-            log.info("ℹ️ [PONTE | TWS-IN | OPEN] Ordem {} aberta. Ativo: {} {} @ {}. Status TWS: {}.",
-                    orderId, order.action(), order.totalQuantity(), contract.symbol(), orderState.getStatus());
-
-        } catch (Exception e) {
-            log.error("💥 [PONTE | TWS-IN] Erro ao processar openOrder para ID {}.", orderId, e);
+            future.complete(dto);
+            whatIfFutures.remove(orderId);
         }
     }
 
@@ -497,84 +684,83 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
      * ✅ Implementação CRÍTICA do error do EWrapper.
      */
     @Override
-    public void error(int var1, long var2, int var4, String var5, String var6) {
+    public void error(int id, long time, int errorCode, String errorMsg, String advancedOrderRejectJson) {
+        try {
+            // 1. Diagnóstico e Log de Auditoria
+            log.debug("🔍 [DIAGNÓSTICO TWS RAW] ID: {} | CÓDIGO: {} | MENSAGEM: {} | JSON: {}",
+                    id, errorCode, errorMsg, advancedOrderRejectJson);
 
-        final int id = var1;
-        final int errorCode = var4;
-        final String errorMsg = var5;
-        final String extendedMsg = var6;
-
-        log.debug("🔍 [DIAGNÓSTICO TWS RAW] ID: {} | CÓDIGO: {} | MENSAGEM: {} | Detalhe: {}",
-                id, errorCode, errorMsg, extendedMsg);
-
-        // --- NOVO TRATAMENTO CRÍTICO: Falha em Simulações What-If Pendentes ---
-        // Verifica se este ID de erro corresponde a um CompletableFuture de What-If ativo.
-        CompletableFuture<OrderStateDTO> whatIfFuture = whatIfFutures.get(id);
-        if (whatIfFuture != null) {
-            whatIfFutures.remove(id); // Remove imediatamente para evitar processamento futuro
-            log.error("❌ [PONTE | What-If ERRO FATAL] ID: {} | CÓDIGO: {} | Mensagem: '{}'. Simulação falhou, completando Future com exceção.",
-                    id, errorCode, errorMsg);
-
-            // Completa o Future com uma exceção, que será capturada no .join() do sendWhatIfRequest
-            whatIfFuture.completeExceptionally(
-                    new RuntimeException("Simulação What-If Falhou (TWS Code: " + errorCode + "): " + errorMsg)
-            );
-            return; // Termina o processamento. O erro What-If foi tratado.
-        }
-
-        // --- Tratamento de erros gerais e avisos da TWS (Lógica Original) ---
-
-        if (id < 0) {
-            if (errorCode == 2104 || errorCode == 2158) {
-                log.info("✅ [TWS-IN] STATUS DE CONEXÃO: Código {}, Mensagem: '{}'", errorCode, errorMsg);
-            } else if (errorCode == 2107 || errorCode == 2109 || errorCode == 2100) {
-                if (errorCode == 2100) {
-                    log.info("ℹ️ [TWS-IN] INFO DE SISTEMA: Código 2100. Mensagem: 'Inscrição de dados de conta cancelada (Operação Normal da Ponte).'");
-                } else {
-                    log.warn("🟡 [TWS-IN] AVISO: Código {}, Mensagem: '{}'.", errorCode, errorMsg);
-                }
-            } else {
-                log.error("❌ [TWS-IN] ERRO DE SISTEMA: Código {}, Mensagem: '{}'", errorCode, errorMsg);
+            // --- 2. TRATAMENTO DE SIMULAÇÕES WHAT-IF PENDENTES ---
+            CompletableFuture<OrderStateDTO> whatIfFuture = whatIfFutures.get(id);
+            if (whatIfFuture != null) {
+                whatIfFutures.remove(id);
+                log.error("❌ [PONTE | What-If ERRO FATAL] ID: {} | CÓDIGO: {} | Mensagem: '{}'", id, errorCode, errorMsg);
+                whatIfFuture.completeExceptionally(new RuntimeException("Simulação What-If Falhou: " + errorMsg));
+                return;
             }
-        }
-        else {
-            // 🛑 TRATAMENTO CRÍTICO DE REJEIÇÃO ASSÍNCRONA (Ordem Real)
+
+            // --- 3. TRATAMENTO DE ERROS DE CONEXÃO E SISTEMA (ID < 0) ---
+            if (id < 0) {
+                handleSystemErrors(errorCode, errorMsg);
+                return;
+            }
+
+            // --- 4. 🧠 SINERGIA E AUTONOMIA: LIMPEZA DE CAPITAL IMEDIATA ---
+            // Resolve o problema do "Poder de Compra Fantasma"
+            // Independentemente do tipo de erro, devolve o capital reservado ao Buying Power.
+            portfolioService.removePendingOrder(String.valueOf(id));
+
+            // --- 5. 🚀 AUTO-CORREÇÃO DE ID (Resolução do Erro 103) ---
+            // Se o erro for ID duplicado, força o salto de segurança sem intervenção manual.
+            if (errorCode == 103) {
+                log.warn("🔄 [ID-RECOVERY] Erro 103 detectado para ordem {}. Aplicando salto automático no OrderIdManager.", id);
+                orderIdManager.initializeOrUpdate(id + 1000); // Salto preventivo imediato
+            }
+
+            // --- 6. TRATAMENTO DE REJEIÇÃO POR MARGEM (Erro 201 ou 10243) ---
             if (errorCode == 201 || errorCode == 10243) {
-                log.error("🛑🛑🛑 [TWS-ERROR CRÍTICO ORDEM] ID: {} | CÓDIGO: {} | MENSAGEM: '{}'. AÇÃO IMEDIATA NECESSÁRIA.",
-                        id, errorCode, errorMsg);
+                log.error("🛑🚨 [MARGEM] Rejeição detectada no ID {}: {}. Iniciando recuperação...", id, errorMsg);
 
-                try {
-                    // ✅ SINERGIA: Envia a notificação para o Principal via Webhook.
-                    webhookNotifier.sendOrderRejection(id, errorCode, errorMsg);
-                    log.info("📤 Relatório de Rejeição (BrokerID: {}) ENVIADO via Webhook ao sistema Principal.", id);
-                } catch (Exception e) {
-                    // Não esquecer do try-catch e logs explicativos
-                    log.error("❌ Falha ao notificar a rejeição da ordem {} ao Principal: {}", id, e.getMessage(), e);
-                }
+                com.ib.client.Order orderFalha = lastOrdersCache.get(id);
+                com.ib.client.Contract contractFalha = lastContractsCache.get(id);
 
-            } else {
-                // Lógica legada para erros que podem ser do antigo reqMarginWhatIf (mantida, mas com ressalvas)
-                CompletableFuture<MarginWhatIfResponseDTO> legacyWhatIfFuture = pendingMarginWhatIfRequests.get(id);
-                if (legacyWhatIfFuture != null && !legacyWhatIfFuture.isDone()) {
-                    log.warn("⚠️ [Ponte | TWS-IN What-If LEGADO ERROR] Erro {} recebido para reqId LEGADO {}. Completa com erro de margem.", errorCode, id);
+                if (orderFalha != null && contractFalha != null) {
+                    lastOrdersCache.remove(id);
+                    lastContractsCache.remove(id);
 
-                    // Completa com erro para o chamador do método LEGADO
-                    legacyWhatIfFuture.complete(
-                            new MarginWhatIfResponseDTO(
-                                    null,                       // 1. symbol (String)
-                                    BigDecimal.ZERO,            // 2. quantity (BigDecimal)
-                                    BigDecimal.ZERO,            // 3. initialMarginChange (BigDecimal)
-                                    BigDecimal.ZERO,            // 4. maintenanceMarginChange (BigDecimal)
-                                    BigDecimal.ZERO,            // 5. commissionEstimate (BigDecimal)
-                                    "BRL",                      // 6. currency (String - Corrigido para o tipo String do record)
-                                    errorMsg                    // 7. error (String)
-                            )
-                    );
+                    // Notifica o Principal sobre a redução adaptativa
+                    webhookNotifier.sendOrderRejection(id, errorCode, "Margem insuficiente. Reduzindo lote em 40%...");
+
+                    // Dispara a lógica de redução agressiva (Step-Down)
+                    tentarReenvioComReducao(id, contractFalha, orderFalha);
                 } else {
-                    log.warn("🟡 [TWS-IN] AVISO DE ORDEM {}: Código {}, Mensagem: '{}'", id, errorCode, errorMsg);
+                    log.error("❌ [RECOVERY ABORT] Ordem ID {} não encontrada para redução automática.", id);
+                    webhookNotifier.sendOrderRejection(id, errorCode, errorMsg);
                 }
+                return;
             }
+
+            // --- 7. NOTIFICAÇÃO DE ERROS SIGNIFICATIVOS AO PRINCIPAL ---
+            if (isSignificantError(errorCode)) {
+                webhookNotifier.sendOrderRejection(id, errorCode, errorMsg);
+            }
+
+        } catch (Exception e) {
+            log.error("💥 [PONTE | ERROR CALLBACK] Falha fatal no tratamento automático: {}", e.getMessage(), e);
         }
+    }
+
+    private void handleSystemErrors(int errorCode, String errorMsg) {
+        if (errorCode == 2104 || errorCode == 2158 || errorCode == 2106) {
+            log.info("✅ [TWS-IN] STATUS DE CONEXÃO: Código {}", errorCode);
+        } else {
+            log.warn("🟡 [TWS-IN] INFO/AVISO: Código {} - {}", errorCode, errorMsg);
+        }
+    }
+
+    private boolean isSignificantError(int code) {
+        // Filtra códigos informativos para focar em erros de execução
+        return code != 2109 && code != 2104 && code != 2106 && code != 2107 && code != 2100;
     }
 
     @Deprecated
@@ -717,15 +903,30 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     @Override
     public void nextValidId(int orderId) {
         try {
-            log.info("✅ Conexão estabelecida com sucesso. Próximo ID de Ordem Válido: {}", orderId);
-            orderIdManager.initializeOrUpdate(orderId);
+            log.info("📡 [TWS-CONNECT] Recebido ID sugerido pela corretora: {}", orderId);
+
+            // 🛡️ SINERGIA DE SEGURANÇA: Resolve o Erro 103 (Duplicate ID)
+            // Sempre pega o maior entre o sugerido pela TWS e o nosso cache local,
+            // aplicando o salto definido no OrderIdManager.
+            int currentId = orderIdManager.getCurrentId();
+            int safeId = Math.max(orderId, currentId);
+
+            // O initializeOrUpdate agora contém o salto de +2000 unidades
+            orderIdManager.initializeOrUpdate(safeId);
+
+            log.warn("✅ [TWS-SYNC] IDs sincronizados. Próximo ID seguro: {}", orderIdManager.getCurrentId());
+
+            // Libera a trava de conexão para o ecossistema
             connectionLatch.countDown();
 
-            // 🚨 DISPARO CRÍTICO: Dispara a requisição de Margem Crítica após a conexão
+            // 🚨 DISPARO CRÍTICO: Popula imediatamente o cache de margem (EL/BP)
+            // essencial para o DeleveragingService agir.
             requestCriticalMarginData();
 
         } catch (Exception e) {
-            log.error("💥 [Ponte IBKR] Falha ao processar nextValidId {}. Rastreando.", orderId, e);
+            log.error("💥 [Ponte IBKR] Falha fatal ao processar nextValidId {}: {}", orderId, e.getMessage());
+            // Garante que o sistema não fique travado em caso de erro no callback
+            connectionLatch.countDown();
         }
     }
     // O método whatIfMargin foi removido para garantir a compilação, conforme a interface EWrapper fornecida.

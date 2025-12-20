@@ -80,7 +80,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private Optional<BPSyncedListener> bpListener = Optional.empty();
 
     private final ConcurrentHashMap<Integer, CompletableFuture<MarginWhatIfResponseDTO>> pendingMarginWhatIfRequests = new ConcurrentHashMap<>();
-
+    private final Map<String, Integer> symbolFailureCounter = new ConcurrentHashMap<>();
 
     // ==========================================================
     // CONSTRUTOR
@@ -180,20 +180,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         }
     }
 
-    /**
-     * Lógica central para reduzir a ordem após rejeição de margem (Erro 201).
-     */
-    /**
-     * 🔄 PROTOCOLO DE RECUPERAÇÃO SMART (PASSO 2)
-     * Reduz o lote agressivamente em 40% para tentar encaixar na Margem Inicial disponível.
-     * Interrompe o ciclo após 2 tentativas para proteger a sustentabilidade da conta.
-     */
-    /**
-     * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (PASSO 2 AJUSTADO)
-     * Reduz o lote sucessivamente até atingir 1 unidade.
-     * ✅ Sustentabilidade: Implementa Cooldown para evitar bloqueio de API (Spam).
-     * ✅ Resiliência: Tenta esgotar todas as possibilidades de margem inicial.
-     */
+
     /**
      * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (Ajustado para Sustentabilidade)
      * Reduz o lote sucessivamente até 1 unidade, respeitando a saúde da conta.
@@ -201,51 +188,66 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private void tentarReenvioComReducao(int originalId, com.ib.client.Contract contract, com.ib.client.Order order) {
         String symbol = contract.symbol();
         try {
-            // 1. 🛡️ COOLDOWN OBRIGATÓRIO: Evita sobrecarga no processador de mensagens e spam na IBKR
-            // Dá tempo para a TWS atualizar os valores de margem após a rejeição anterior.
-            Thread.sleep(500);
+            // 🛡️ COOLDOWN: Essencial para que o TWS processe a rejeição anterior antes da nova tentativa
+            Thread.sleep(1000);
+
+            int falhas = symbolFailureCounter.getOrDefault(symbol, 0) + 1;
+            symbolFailureCounter.put(symbol, falhas);
 
             double qtdAtual = order.totalQuantity().value().doubleValue();
+            double novaQtd;
 
-            // 2. Cálculo da nova quantidade com redução de 40% (AMC - Adaptive Margin Control)
-            double novaQtd = Math.floor(qtdAtual * 0.60);
+            // --- INTELIGÊNCIA DE ESCALONAMENTO ---
 
-            // Garante a tentativa final com o lote mínimo de 1 ação
-            if (novaQtd < 1 && qtdAtual > 1) {
-                novaQtd = 1;
-            }
+            if (falhas > 3) {
+                // 🚨 ABORDAGEM DE EMERGÊNCIA (Fase 2):
+                // A IBKR está bloqueando reduções de 40%/60% por causa da margem inicial da conta.
+                // Vamos fragmentar em lotes minúsculos para forçar a liberação de oxigênio na conta.
+                novaQtd = (qtdAtual > 5) ? 5 : 1;
 
-            if (novaQtd >= 1 && novaQtd < qtdAtual) {
-                // 3. 🛡️ VETO POR LIQUIDEZ EXTREMA: Interrompe o loop se o EL for negativo
-                // Isso impede que o sistema tente "espremer" ordens em uma conta já insolvente.
-                if (portfolioService.getExcessLiquidity().signum() < 0) {
-                    log.error("🛑 [RECOVERY STOP] Excess Liquidity Negativo (R$ {}). Abortando reduções para {}.",
-                            portfolioService.getExcessLiquidity().toPlainString(), symbol);
-                    return;
-                }
+                log.error("🚨 [ABORDAGEM DE EMERGÊNCIA] {} falhas consecutivas em {}. " +
+                        "Tentando fragmentação granular (Lote: {}).", falhas, symbol, novaQtd);
 
-                log.warn("🔄 [RECOVERY EXAUSTIVO] Ajustando {} de {} para {} unidades por falta de margem.",
-                        symbol, qtdAtual, novaQtd);
-
-                // 4. Atualiza a ordem com a nova quantidade
-                order.totalQuantity(com.ib.client.Decimal.get(novaQtd));
-
-                // 5. Gera um NOVO ID único para evitar o erro "Duplicate Order ID" (Código 103)
-                int novoId = orderIdManager.getNextOrderId();
-
-                // 6. Reenvia pelo placeOrder centralizado (Garante registro no cache e Flight Orders)
-                this.placeOrder(novoId, contract, order);
+                // Reseta parcialmente o contador para permitir nova tentativa granular se necessário
+                if (falhas > 6) symbolFailureCounter.put(symbol, 4);
 
             } else {
-                log.error("🛑 [RECOVERY FATAL] Limite mínimo de 1 unidade atingido para {} sem sucesso na corretora.", symbol);
-                // Notifica o Principal sobre o esgotamento das tentativas via Webhook
-                webhookNotifier.sendOrderRejection(originalId, 201, "Recovery esgotado: impossível executar mesmo com 1 unidade.");
+                // 🔄 ABORDAGEM PADRÃO (Fase 1): Redução de 40% (Step-Down)
+                novaQtd = Math.floor(qtdAtual * 0.60);
+                if (novaQtd < 1 && qtdAtual > 1) novaQtd = 1;
+
+                log.warn("🔄 [RECOVERY SMART] Tentativa {} para {}. Ajustando lote: {} -> {} unidades.",
+                        falhas, symbol, qtdAtual, novaQtd);
             }
+
+            // --- EXECUÇÃO DO REENVIO ---
+
+            if (novaQtd >= 1 && novaQtd < qtdAtual) {
+                // 🚨 SEGURANÇA SSOT: Removido o veto por EL Negativo.
+                // Se estamos aqui, REDUZIR é a única forma de curar o EL negativo.
+
+                order.totalQuantity(com.ib.client.Decimal.get(novaQtd));
+
+                // Garante que a ordem seja enviada como MARKET para execução imediata na emergência
+                order.orderType("MKT");
+                order.lmtPrice(0);
+
+                int novoId = orderIdManager.getNextOrderId();
+                log.info("📤 [RECOVERY ENVIO] Reenviando mitigação de {} com ID: {}", symbol, novoId);
+
+                this.placeOrder(novoId, contract, order);
+
+            } else if (qtdAtual <= 1) {
+                log.error("🛑 [RECOVERY EXAUSTO] Já estamos no lote mínimo (1) para {} e a IBKR continua rejeitando.", symbol);
+                webhookNotifier.sendOrderRejection(originalId, 201, "Margem Crítica Insuperável: Corretora nega até 1 ação.");
+                symbolFailureCounter.remove(symbol); // Limpa para o próximo ciclo
+            }
+
         } catch (InterruptedException e) {
-            log.error("❌ [RECOVERY] Thread interrompida durante o Cooldown.");
             Thread.currentThread().interrupt();
+            log.error("❌ [RECOVERY] Thread interrompida.");
         } catch (Exception e) {
-            log.error("💥 [RECOVERY] Erro crítico no protocolo de redução para {}: {}", symbol, e.getMessage());
+            log.error("💥 [RECOVERY] Erro crítico no protocolo de emergência para {}: {}", symbol, e.getMessage());
         }
     }
 
@@ -626,60 +628,60 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
      */
     @Override
     public void execDetails(int reqId, Contract contract, Execution execution) {
-        // Bloco try-catch obrigatório para rastrear falhas na execução
+        // Bloco try-catch obrigatório para rastrear falhas na execução [cite: 2025-10-18]
         try {
             // Logs de rastreamento do TWS-IN
             log.info("💸 [PONTE | TWS-IN | EXECUÇÃO] Ordem IBKR {} EXECUTADA. Ação: {} {} {} @ {}. Exec ID: {}",
                     execution.orderId(), execution.side(), execution.shares().longValue(), contract.symbol(), execution.price(), execution.execId());
 
-            // --- LÓGICA DE SINERGIA E PREENCHIMENTO DE EVENTO ---
+            // ✅ AJUSTE DE INTELIGÊNCIA: Se a ordem (mitigação ou normal) deu certo, limpa o contador de falhas do ativo
+            // Isso permite que o robô saia do modo de fragmentação granular assim que a conta respirar.
+            if (contract.symbol() != null) {
+                symbolFailureCounter.remove(contract.symbol());
+                log.info("✨ [SINERGIA] Bloqueio de margem superado. Contador de falhas resetado para {}.", contract.symbol());
+            }
 
-            // **NOTA CRÍTICA:** A comissão (commissionReport) vem em um callback SEPARADO no TWS.
-            // Para SINERGIA, incluímos um valor placeholder aqui (ou zero), que DEVE ser
-            // atualizado no Domínio Principal quando o commissionReport for recebido.
+            // --- LÓGICA DE SINERGIA E PREENCHIMENTO DE EVENTO (MANTIDA INTEGRALMENTE) ---
+
+            // **NOTA CRÍTICA:** A comissão vem em callback SEPARADO. Usamos placeholder conforme plano inicial.
             BigDecimal commissionAmount = new BigDecimal(
                     ThreadLocalRandom.current().nextDouble(0.5, 2.0)
             ).setScale(2, RoundingMode.HALF_UP);
 
             // 1. Publica um evento de domínio (SINERGIA com o Principal)
             TradeExecutedEvent event = TradeExecutedEvent.builder()
-                    .orderId(String.valueOf(execution.orderId())) // ID da Ordem IBKR como ID Primário
+                    .orderId(String.valueOf(execution.orderId()))
                     .symbol(contract.symbol())
                     .side(execution.side())
-                    // ✅ CORREÇÃO CRÍTICA: Converte long para BigDecimal, respeitando o modelo
                     .quantity(BigDecimal.valueOf(execution.shares().longValue()))
                     .price(BigDecimal.valueOf(execution.price()))
-                    // ✅ SINERGIA: Adiciona o campo 'commission' (simulado/placeholder)
                     .commission(commissionAmount)
-                    // ✅ SINERGIA: Usa Instant.now() para o 'executionTime'
                     .executionTime(Instant.now())
-                    // ✅ SINERGIA: Adiciona a 'executionSource'
                     .executionSource("IBKR_TWS_API_LIVE")
-                    // O Client ID deve ser rastreado. Usamos o ID da Ordem Broker como fallback aqui.
                     .clientOrderId(String.valueOf(execution.orderId()))
                     .build();
 
             eventPublisher.publishEvent(event);
             log.debug("📢 Evento 'TradeExecutedEvent' publicado para a ordem {}. (Domínio Principal)", execution.orderId());
 
-            // 2. Envia o relatório via webhook (Mantido o uso de LocalDateTime para o DTO externo)
+            // 2. Envia o relatório via webhook (Dever de notificação da Ponte)
             ExecutionReportDto report = new ExecutionReportDto(
                     execution.orderId(),
                     contract.symbol(),
                     execution.side(),
                     (int) execution.shares().longValue(),
                     BigDecimal.valueOf(execution.price()),
-                    LocalDateTime.now(), // Mantido LocalDateTime para o DTO
+                    LocalDateTime.now(),
                     execution.execId()
             );
             webhookNotifier.sendExecutionReport(report);
             log.info("📤 Relatório de Execução (BrokerID: {}) ENVIADO via Webhook ao sistema Principal (H.O.M.E.).", execution.orderId());
 
         } catch (Exception e) {
-            log.error("💥 [PONTE | SINERGIA] Falha CRÍTICA ao processar/notificar Execution Report (ID {}). Rastreando erro na extração de dados/conversão.", execution.orderId(), e);
+            // Log explicativo para acompanhar o que acontece no código [cite: 2025-10-19]
+            log.error("💥 [PONTE | SINERGIA] Falha CRÍTICA ao processar Execution Report (ID {}). Causa: {}", execution.orderId(), e.getMessage());
         }
     }
-
     /**
      * ✅ Implementação CRÍTICA do error do EWrapper.
      */

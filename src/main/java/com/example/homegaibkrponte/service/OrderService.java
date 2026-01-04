@@ -88,6 +88,10 @@ public class OrderService {
             log.warn("🛡️ [PONTE | PRIORIDADE] Ordem de mitigação para {} detectada. Ignorando simulação What-If para destravar a conta.", orderDto.symbol());
             int finalOrderId = orderIdManager.getNextOrderId();
             ibkrOrder.orderId(finalOrderId);
+
+            // 🔗 SINERGIA: Mapeia o ID para permitir cancelamento/purga posterior
+            orderIdManager.linkIds(orderDto.clientOrderId(), finalOrderId);
+
             connector.placeOrder(finalOrderId, contract, ibkrOrder);
             return orderDto.withOrderId(finalOrderId);
         }
@@ -98,6 +102,9 @@ public class OrderService {
 
             int finalOrderId = orderIdManager.getNextOrderId();
             ibkrOrder.orderId(finalOrderId);
+
+            // 🔗 SINERGIA: Mapeia o ID definitivo antes do envio real
+            orderIdManager.linkIds(orderDto.clientOrderId(), finalOrderId);
 
             if (!temMargem) {
                 double qtdOriginal = ibkrOrder.totalQuantity().value().doubleValue();
@@ -142,4 +149,42 @@ public class OrderService {
         return masterOrderDto.withOrderId(masterId)
                 .withChildOrders(List.of(slDto.withOrderId(slId), tpDto.withOrderId(tpId)));
     }
+
+    /**
+     * 🧹 [SINERGIA DE CANCELAMENTO] Traduz e envia o comando de cancelamento para a TWS.
+     * Crucial para liberar o Buying Power (Margem) após falha na Auto-Cura no Principal.
+     */
+    public void cancelOrder(String clientOrderId) {
+        try {
+            if (clientOrderId == null || clientOrderId.isBlank()) return;
+
+            log.warn("🧹 [ORDER-SERVICE] Iniciando protocolo de cancelamento para ClientID: {}", clientOrderId);
+
+            // 1. Recupera o ID numérico vinculado no momento do placeOrder
+            Integer ibkrOrderId = orderIdManager.getIbkrOrderId(clientOrderId);
+
+            if (ibkrOrderId != null) {
+                // 2. Comando Real conforme a assinatura do EClient
+                // Passamos um objeto OrderCancel vazio para compatibilidade com versões modernas
+                com.ib.client.OrderCancel cancelRequest = new com.ib.client.OrderCancel();
+
+                connector.getClient().cancelOrder(ibkrOrderId, cancelRequest);
+
+                log.info("✅ [ORDER-SERVICE] Comando cancelOrder enviado para TWS (IBKR ID: {}).", ibkrOrderId);
+
+                // 3. Notifica o Principal via alerta de liquidez (Recuperação de Margem)
+                webhookNotifier.notifyWarningLiquidity("Ordem " + clientOrderId + " cancelada na Ponte para liberar margem.");
+
+                // 4. Limpa o mapeamento para poupar memória
+                orderIdManager.removeMapping(clientOrderId);
+            } else {
+                log.error("❌ [ORDER-SERVICE] Cancelamento abortado: ClientID {} não mapeado para um ID IBKR.", clientOrderId);
+            }
+
+        } catch (Exception e) {
+            log.error("💥 [ORDER-SERVICE] Erro crítico ao cancelar ordem {}: {}", clientOrderId, e.getMessage());
+            throw new RuntimeException("Falha ao cancelar na Ponte: " + e.getMessage());
+        }
+    }
+
 }

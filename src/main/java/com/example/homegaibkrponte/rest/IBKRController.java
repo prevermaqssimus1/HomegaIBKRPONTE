@@ -19,6 +19,7 @@ import java.math.BigDecimal;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -47,6 +48,26 @@ public class IBKRController {
         this.portfolioService = portfolioService;
         this.ibkrMapper = ibkrMapper;
         this.orderIdManager = orderIdManager;
+    }
+
+    /**
+     * 🛡️ ENDPOINT DE SINERGIA T+1 (QUALQUER MARÉ)
+     * Retorna a lista de ativos que foram comprados HOJE.
+     * Essencial para o Principal diferenciar Estoque de Day Trade no boot.
+     */
+    @GetMapping("/bought-today")
+    public ResponseEntity<Set<String>> getSymbolsBoughtToday() {
+        log.info("📡 [PONTE | API] Requisição de inventário intraday recebida.");
+        try {
+            // Chama o método que implementamos no IBKRConnector
+            Set<String> symbols = connector.getSymbolsBoughtToday();
+
+            log.info("✅ [PONTE | RT-ENVIO] Ativos comprados hoje enviados ao Principal: {}", symbols);
+            return ResponseEntity.ok(symbols);
+        } catch (Exception e) {
+            log.error("❌ [PONTE] Erro ao listar ativos comprados hoje: {}", e.getMessage());
+            return ResponseEntity.ok(Collections.emptySet());
+        }
     }
 
     /**
@@ -187,6 +208,56 @@ public class IBKRController {
             log.error("🛑 [PONTE | What-If FALHA] Motivo: {}", e.getMessage());
             return ResponseEntity.ok(new WhatIfResponseDTO(false, BigDecimal.ZERO,
                     portfolioService.getExcessLiquidity(), e.getMessage()));
+        }
+    }
+
+    /**
+     * 🔓 ENDPOINT DE SINERGIA: Destrava o sistema de recuperação de margem.
+     * Chamado pelo Principal após uma venda bem-sucedida para limpar
+     * bloqueios de Circuit Breaker na Ponte.
+     */
+    @PostMapping("/clear-margin-faults")
+    public ResponseEntity<String> clearMarginFaults(@RequestParam(required = false) String symbol) {
+        try {
+            if (symbol != null && !symbol.isBlank()) {
+                log.warn("🔓 [PONTE | RESET] Limpando contador de falhas específico para: {}", symbol);
+                connector.clearSymbolFailure(symbol); // Método a ser adicionado no IBKRConnector
+                return ResponseEntity.ok("Reset de falhas concluído para " + symbol);
+            } else {
+                log.warn("🔓 [PONTE | RESET GLOBAL] Limpando TODOS os contadores de falha de ativos.");
+                connector.clearAllFailures(); // Método a ser adicionado no IBKRConnector
+                return ResponseEntity.ok("Reset global de falhas concluído.");
+            }
+        } catch (Exception e) {
+            log.error("❌ Erro ao limpar falhas de margem: {}", e.getMessage());
+            return ResponseEntity.internalServerError().body(e.getMessage());
+        }
+    }
+
+    /**
+     * 📊 ENDPOINT DE TELEMETRIA: Verifica se um ativo está em estado de bloqueio.
+     */
+    @GetMapping("/margin/check-fault/{symbol}")
+    public ResponseEntity<Integer> getSymbolFailureCount(@PathVariable String symbol) {
+        int count = connector.getFailureCount(symbol); // Método a ser adicionado no IBKRConnector
+        return ResponseEntity.ok(count);
+    }
+
+    @DeleteMapping("/order/{clientOrderId}")
+    public ResponseEntity<Void> cancelOrder(@PathVariable String clientOrderId) {
+        log.warn("🧹 [PONTE | CANCEL] Recebida solicitação de cancelamento para: {}", clientOrderId);
+
+        try {
+            // 1. Comando via OrderService (que já tem acesso ao conector e ao mapeamento de IDs)
+            // Se o seu OrderService não tiver o cancelOrder, precisaremos criar lá também.
+            orderService.cancelOrder(clientOrderId);
+
+            log.info("✅ [PONTE | CANCEL] Ordem {} cancelada com sucesso na TWS.", clientOrderId);
+            return ResponseEntity.ok().build();
+
+        } catch (Exception e) {
+            log.error("❌ [PONTE | CANCEL] Erro ao processar cancelamento para {}: {}", clientOrderId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
 }

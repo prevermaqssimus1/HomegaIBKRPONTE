@@ -85,7 +85,7 @@ public class OrderFactory {
         // 5. CONFIGURAÇÕES PADRÃO E CONTA
         ibkrOrder.tif("GTC");
         ibkrOrder.outsideRth(true);
-        ibkrOrder.account(connector.getAccountId()); // Garante o envio para DUN652604
+        ibkrOrder.account(connector.getAccountId());
 
         return ibkrOrder;
     }

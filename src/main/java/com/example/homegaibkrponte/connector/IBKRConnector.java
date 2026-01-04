@@ -27,6 +27,7 @@ import com.ib.client.protobuf.*;
 import io.micrometer.core.instrument.Gauge;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -34,7 +35,9 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -78,10 +81,12 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private final Map<String, Integer> recoveryAttempts = new ConcurrentHashMap<>();
     // ✅ CAMPO SINÉRGICO: Listener de Callback para o Principal
     private Optional<BPSyncedListener> bpListener = Optional.empty();
+    private Set<String> symbolsBoughtToday = Collections.synchronizedSet(new HashSet<>());
 
     private final ConcurrentHashMap<Integer, CompletableFuture<MarginWhatIfResponseDTO>> pendingMarginWhatIfRequests = new ConcurrentHashMap<>();
     private final Map<String, Integer> symbolFailureCounter = new ConcurrentHashMap<>();
-
+    @Value("${api.ibkr.account-id:U22445775}") // DUN... fica como fallback
+    private String accountId;
     // ==========================================================
     // CONSTRUTOR
     // ==========================================================
@@ -112,6 +117,22 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
                 .description("Excess liquidity atual no cache da Ponte")
                 .register(meterRegistry);
         log.info("ℹ️ [Ponte IBKR] Inicializador concluído. Mappers e Serviços injetados (Sinergia OK).");
+    }
+
+    public Set<String> getSymbolsBoughtToday() {
+        symbolsBoughtToday.clear(); // Limpa para nova consulta
+
+        // Filtro: Apenas execuções de HOJE
+        ExecutionFilter filter = new ExecutionFilter();
+        filter.time(LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-00:00:00")));
+
+        log.info("📡 [PONTE] Solicitando execuções do dia para validar estoque...");
+        client.reqExecutions(9999, filter); // 9999 é um ID fixo para esta consulta
+
+        // Pequena espera para o callback preencher a lista (500ms a 1s é suficiente no boot)
+        try { Thread.sleep(1000); } catch (InterruptedException e) { }
+
+        return new HashSet<>(symbolsBoughtToday);
     }
 
     // ==========================================================
@@ -183,65 +204,55 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
     /**
      * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (Ajustado para Sustentabilidade)
-     * Reduz o lote sucessivamente até 1 unidade, respeitando a saúde da conta.
+     * Implementa CIRCUIT BREAKER para evitar loops infinitos de rejeição 201.
      */
     private void tentarReenvioComReducao(int originalId, com.ib.client.Contract contract, com.ib.client.Order order) {
         String symbol = contract.symbol();
         try {
-            // 🛡️ COOLDOWN: Essencial para que o TWS processe a rejeição anterior antes da nova tentativa
-            Thread.sleep(1000);
+            // 🛡️ COOLDOWN: Tempo para o TWS limpar a rejeição anterior
+            Thread.sleep(1500);
 
             int falhas = symbolFailureCounter.getOrDefault(symbol, 0) + 1;
             symbolFailureCounter.put(symbol, falhas);
 
             double qtdAtual = order.totalQuantity().value().doubleValue();
+
+            // 🛑 LÓGICA DE CIRCUIT BREAKER:
+            // Se já falhou mais de 5 vezes ou se a última tentativa já foi o lote mínimo (1.0)
+            if (qtdAtual <= 1.0 || falhas > 6) {
+                log.error("🛑 [CIRCUIT BREAKER] Rejeição persistente em {}. Falhas: {}. Qtd Final: {}. Interrompendo mitigação para preservar banda.",
+                        symbol, falhas, qtdAtual);
+
+                // Notifica o Principal via Webhook para ele saber que o ativo está "travado" por margem
+                webhookNotifier.sendOrderRejection(originalId, 201, "CIRCUIT BREAKER: Margem exausta mesmo no lote mínimo para " + symbol);
+
+                // Limpeza de estado para permitir que o sistema tente de novo apenas se o Oráculo mandar uma nova ordem no futuro
+                symbolFailureCounter.remove(symbol);
+                return;
+            }
+
             double novaQtd;
 
             // --- INTELIGÊNCIA DE ESCALONAMENTO ---
-
             if (falhas > 3) {
-                // 🚨 ABORDAGEM DE EMERGÊNCIA (Fase 2):
-                // A IBKR está bloqueando reduções de 40%/60% por causa da margem inicial da conta.
-                // Vamos fragmentar em lotes minúsculos para forçar a liberação de oxigênio na conta.
-                novaQtd = (qtdAtual > 5) ? 5 : 1;
-
-                log.error("🚨 [ABORDAGEM DE EMERGÊNCIA] {} falhas consecutivas em {}. " +
-                        "Tentando fragmentação granular (Lote: {}).", falhas, symbol, novaQtd);
-
-                // Reseta parcialmente o contador para permitir nova tentativa granular se necessário
-                if (falhas > 6) symbolFailureCounter.put(symbol, 4);
-
+                // 🚨 FASE DE EMERGÊNCIA: Fragmentação agressiva
+                novaQtd = (qtdAtual > 10) ? Math.floor(qtdAtual * 0.3) : 1.0;
+                log.error("🚨 [ABORDAGEM DE EMERGÊNCIA] Tentando fragmentação granular para {}. Qtd: {}", symbol, novaQtd);
             } else {
-                // 🔄 ABORDAGEM PADRÃO (Fase 1): Redução de 40% (Step-Down)
+                // 🔄 FASE PADRÃO: Redução de 40% (Step-Down)
                 novaQtd = Math.floor(qtdAtual * 0.60);
-                if (novaQtd < 1 && qtdAtual > 1) novaQtd = 1;
-
-                log.warn("🔄 [RECOVERY SMART] Tentativa {} para {}. Ajustando lote: {} -> {} unidades.",
-                        falhas, symbol, qtdAtual, novaQtd);
+                if (novaQtd < 1) novaQtd = 1.0;
+                log.warn("🔄 [RECOVERY SMART] Tentativa {} para {}. Ajustando lote: {} -> {}", falhas, symbol, qtdAtual, novaQtd);
             }
 
-            // --- EXECUÇÃO DO REENVIO ---
+            // EXECUÇÃO DO REENVIO
+            order.totalQuantity(com.ib.client.Decimal.get(novaQtd));
+            order.orderType("MKT"); // Força Market para garantir tentativa de execução imediata
+            order.lmtPrice(0);
 
-            if (novaQtd >= 1 && novaQtd < qtdAtual) {
-                // 🚨 SEGURANÇA SSOT: Removido o veto por EL Negativo.
-                // Se estamos aqui, REDUZIR é a única forma de curar o EL negativo.
-
-                order.totalQuantity(com.ib.client.Decimal.get(novaQtd));
-
-                // Garante que a ordem seja enviada como MARKET para execução imediata na emergência
-                order.orderType("MKT");
-                order.lmtPrice(0);
-
-                int novoId = orderIdManager.getNextOrderId();
-                log.info("📤 [RECOVERY ENVIO] Reenviando mitigação de {} com ID: {}", symbol, novoId);
-
-                this.placeOrder(novoId, contract, order);
-
-            } else if (qtdAtual <= 1) {
-                log.error("🛑 [RECOVERY EXAUSTO] Já estamos no lote mínimo (1) para {} e a IBKR continua rejeitando.", symbol);
-                webhookNotifier.sendOrderRejection(originalId, 201, "Margem Crítica Insuperável: Corretora nega até 1 ação.");
-                symbolFailureCounter.remove(symbol); // Limpa para o próximo ciclo
-            }
+            int novoId = orderIdManager.getNextOrderId();
+            log.info("📤 [RECOVERY ENVIO] Submetendo mitigação reduzida de {} (ID: {})", symbol, novoId);
+            this.placeOrder(novoId, contract, order);
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -249,6 +260,18 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         } catch (Exception e) {
             log.error("💥 [RECOVERY] Erro crítico no protocolo de emergência para {}: {}", symbol, e.getMessage());
         }
+    }
+
+    public void clearSymbolFailure(String symbol) {
+        this.symbolFailureCounter.remove(symbol);
+    }
+
+    public void clearAllFailures() {
+        this.symbolFailureCounter.clear();
+    }
+
+    public int getFailureCount(String symbol) {
+        return this.symbolFailureCounter.getOrDefault(symbol, 0);
     }
 
     /**
@@ -389,10 +412,10 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     public EClientSocket getClient() { return client; }
     public BigDecimal getBuyingPowerCache() { return buyingPowerCache.get(); }
     public BigDecimal getExcessLiquidityCache() {return excessLiquidityCache.get();}
-    public String getAccountId() {
-        return "DUN652604";
-    }
 
+    public String getAccountId() {
+        return this.accountId;
+    }
 
     /**
      * Requisita dados de Market Data.

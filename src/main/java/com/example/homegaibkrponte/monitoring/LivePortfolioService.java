@@ -83,6 +83,8 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
     private static final String KEY_EXCESS_LIQUIDITY_NORMALIZED = "EXCESSLIQUIDITY";
     private static final String KEY_BUYING_POWER_NORMALIZED = "BUYINGPOWER";
 
+    @Value("${api.ibkr.account-id:U22445775}") // DUN... fica como fallback
+    private String accountId;
 
     // --- CHAVES DE MARGEM (AJUSTADAS PARA UPPERCASE, sinergia com o cache) ---
     // IBKR usa "InitMarginReq" e "MaintMarginReq", mas a Ponte armazena tudo em UPPERCASE.
@@ -177,6 +179,24 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
             log.error("❌ Falha no cálculo de utilização de margem: {}", e.getMessage());
             return BigDecimal.ONE;
         }
+    }
+
+    /**
+     * 🛡️ MÉTODO DE AUDITORIA: Verifica se os dados no cache são "frescos" (menos de 60s).
+     * Se retornar false, o Orquestrador saberá que a conexão com a IBKR caiu ou está travada.
+     */
+    public boolean isDataFresh() {
+        if (accountValuesCache.isEmpty()) return false;
+
+        // Verifica se recebemos o NLV (Net Liquidation Value)
+        boolean hasNlv = accountValuesCache.containsKey(KEY_NET_LIQUIDATION);
+
+        // Se o latch ainda está em 1, significa que a IBKR nunca mandou os dados de margem
+        boolean isMarginLoaded = isCriticalMarginDataLoaded.get();
+
+        log.info("🔍 [AUDITORIA] NLV Presente: {} | Margens Carregadas: {}", hasNlv, isMarginLoaded);
+
+        return hasNlv && isMarginLoaded;
     }
 
     /**
@@ -881,7 +901,7 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
 
     // Método que fornece o Account ID (necessário para a validação)
     public String getAccountId() {
-        return "DUN652604";
+        return this.accountId;
     }
 
     public ConcurrentHashMap<String, BigDecimal> getAccountValuesCache() {

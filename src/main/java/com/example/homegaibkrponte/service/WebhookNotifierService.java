@@ -153,4 +153,23 @@ public class WebhookNotifierService {
                         err -> log.error("❌ [WEBHOOK-OUT] Falha no alerta de liquidez: {}", err.getMessage())
                 );
     }
+
+    public void sendOrderCancellation(long orderId, String clientOrderId) {
+        // Código 202 na IBKR significa "Cancelled"
+        OrderRejectionDto rejection = new OrderRejectionDto(orderId, 202, "Order cancelled to release Buying Power");
+
+        log.warn("🧹 [PONTE -> WINSTON] Notificando CANCELAMENTO da ordem {} para liberar saldo.", clientOrderId);
+
+        this.webClient.post()
+                .uri(EXECUTION_STATUS_URI) // Mesmo endpoint que o Winston já ouve
+                .bodyValue(rejection)
+                .retrieve()
+                .toBodilessEntity()
+                .retryWhen(retrySpec)
+                .subscribe(
+                        res -> log.info("✅ [WEBHOOK-OUT] Cancelamento confirmado no Principal."),
+                        err -> log.error("❌ [WEBHOOK-OUT] Falha ao notificar cancelamento.")
+                );
+    }
+
 }

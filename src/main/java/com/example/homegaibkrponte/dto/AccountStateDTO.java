@@ -14,6 +14,7 @@ public record AccountStateDTO(
         @JsonProperty("cashBalance") BigDecimal cashBalance,
         @JsonProperty("buyingPower") BigDecimal buyingPower,
         @JsonProperty("excessLiquidity") BigDecimal excessLiquidity,
+        @JsonProperty("sma") BigDecimal sma, // 🚀 NOVO: A Ponte agora "enxerga" o SMA
         @JsonProperty("initMarginReq") BigDecimal initMarginReq,
         @JsonProperty("maintainMarginReq") BigDecimal maintainMarginReq,
         @JsonProperty("availableFunds") BigDecimal availableFunds,

@@ -69,6 +69,9 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private final ConcurrentHashMap<String, BigDecimal> marketPriceCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, com.ib.client.Order> lastOrdersCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, com.ib.client.Contract> lastContractsCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, CompletableFuture<List<Candle>>> historicalFutures = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, List<Candle>> historicalDataBuffers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, String> requestSymbols = new ConcurrentHashMap<>();
     private final OrderIdManager orderIdManager;
     private final IBKRMapper ibkrMapper;
     private String lastWhatIfEl = "0.0";
@@ -85,8 +88,14 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
     private final ConcurrentHashMap<Integer, CompletableFuture<MarginWhatIfResponseDTO>> pendingMarginWhatIfRequests = new ConcurrentHashMap<>();
     private final Map<String, Integer> symbolFailureCounter = new ConcurrentHashMap<>();
-    @Value("${api.ibkr.account-id:U22445775}") // DUN... fica como fallback
+    @Value("${api.ibkr.account-id:DUN652604}") // DUN... fica como fallback
     private String accountId;
+
+    private EClientSocket accountClient;
+    private EReaderSignal accountReaderSignal;
+    private static final int MARKET_DATA_CLIENT_ID = 115;
+    private static final int ACCOUNT_SYNC_CLIENT_ID = 116;
+
     // ==========================================================
     // CONSTRUTOR
     // ==========================================================
@@ -107,6 +116,12 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         this.client = new EClientSocket(this, readerSignal);
         this.ibkrMapper = ibkrMapper;
         this.meterRegistry = meterRegistry;
+        // Canal 1 (Preços)
+        this.readerSignal = new EJavaSignal();
+        this.client = new EClientSocket(this, readerSignal);
+        // Canal 2 (Gestão/Conta)
+        this.accountReaderSignal = new EJavaSignal();
+        this.accountClient = new EClientSocket(this, accountReaderSignal);
 
         // Observabilidade local (Ponte)
         Gauge.builder("ponte.cache.buying_power", this, connector -> connector.buyingPowerCache.get().doubleValue())
@@ -152,6 +167,11 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
     public String getLastWhatIfExcessLiquidity() {
         return this.lastWhatIfEl;
+    }
+
+
+    public EClientSocket getAccountClient() {
+        return this.accountClient;
     }
 
 
@@ -233,7 +253,11 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
             double novaQtd;
 
-            // --- INTELIGÊNCIA DE ESCALONAMENTO ---
+            if (falhas == 1) {
+                novaQtd = Math.floor(qtdAtual * 0.30); // Tenta apenas 30% do lote original
+            } else {
+                novaQtd = Math.floor(qtdAtual * 0.50); // Reduções subsequentes
+            }
             if (falhas > 3) {
                 // 🚨 FASE DE EMERGÊNCIA: Fragmentação agressiva
                 novaQtd = (qtdAtual > 10) ? Math.floor(qtdAtual * 0.3) : 1.0;
@@ -261,6 +285,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             log.error("💥 [RECOVERY] Erro crítico no protocolo de emergência para {}: {}", symbol, e.getMessage());
         }
     }
+
 
     public void clearSymbolFailure(String symbol) {
         this.symbolFailureCounter.remove(symbol);
@@ -417,46 +442,80 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         return this.accountId;
     }
 
+
+
     /**
-     * Requisita dados de Market Data.
+     * 📡 [PONTE | SMART-ROUTER]
+     * Solicita dados de mercado em tempo real.
+     * Suporta Japão (TSEJ) e EUA (SMART Routing) para failover.
      */
     public void requestMarketData(String symbol) {
+        if (!isConnected()) {
+            log.error("❌ [PONTE] Falha ao assinar {}: Socket não conectado.", symbol);
+            return;
+        }
+
         try {
-            log.info("➡️ [Ponte IBKR] Iniciando preparação da requisição de Market Data para {}.", symbol);
-
             Contract contract = new Contract();
-            contract.symbol(symbol);
             contract.secType("STK");
-            contract.exchange("SMART");
-            contract.currency("USD");
 
+            // 1. 🎛️ LÓGICA DE ROTEAMENTO REGIONAL
+            if (symbol.endsWith(".T")) {
+                // JAPÃO
+                String cleanSymbol = symbol.split("\\.")[0];
+                contract.symbol(cleanSymbol);
+                contract.exchange("TSEJ");
+                contract.primaryExch("TSEJ");
+                contract.currency("JPY");
+                log.info("🎌 [IBKR-ROUTER] Configurando contrato JAPÃO para: {}", symbol);
+            } else {
+                // EUA (Failover do Finnhub)
+                contract.symbol(symbol.toUpperCase());
+                contract.exchange("SMART"); // Roteamento inteligente da IBKR para melhores preços
+                contract.currency("USD");
+                log.info("🇺🇸 [IBKR-ROUTER] Configurando contrato USA para: {}", symbol);
+            }
+
+            // 2. 🚀 DESTRAVA-SINAL (Real-time vs Delayed)
+            // Força a TWS a enviar dados em tempo real se você tiver a assinatura.
+            client.reqMarketDataType(1);
+
+            // 3. 📝 REGISTRO E DISPARO
             int reqId = getNextReqId();
-
             marketDataRequests.put(reqId, symbol);
+
+            // Parâmetros: "", false, false -> Assinatura padrão de streaming
             client.reqMktData(reqId, contract, "", false, false, null);
 
-            log.info("➡️ [Ponte IBKR] Requisitado Market Data para {} com reqId {}. Dados virão em tickPrice/tickSize.", symbol, reqId);
+            log.info("✅ [PONTE-SINAL] Subscrição ativa para {} (ReqId: {}) via Canal 115.", symbol, reqId);
+
         } catch (Exception e) {
-            log.error("❌ [Ponte IBKR] Falha ao solicitar Market Data para {}: {}", symbol, e.getMessage(), e);
+            log.error("💥 [PONTE-SINAL] Erro crítico ao rotear {}: {}", symbol, e.getMessage());
         }
     }
 
 
     public void requestCriticalMarginData() {
-        if (!isConnected()) {
-            log.error("❌ [Ponte | MARGEM] Conexão inativa. Impossível requisitar sumário de conta.");
+        // Verificamos o canal de gestão (116)
+        if (accountClient == null || !accountClient.isConnected()) {
+            log.error("❌ [CANAL 116] Inativo. Tentando via canal principal como failover.");
+            if (isConnected()) {
+                executeMarginRequest(client); // Fallback no 115 se o 116 cair
+            }
             return;
         }
 
-        // 🛑 AJUSTE CRÍTICO DE LIQUIDEZ: Inclusão das tags de liquidez (ExcessLiquidity, BuyingPower, AvailableFunds)
-        // Isso garante que o cache da Ponte seja populado com liquidez real, prevenindo o alerta de R$ 0,00 no startup.
+        executeMarginRequest(accountClient);
+    }
+
+    private void executeMarginRequest(EClientSocket socketToUse) {
         String tags = "MaintMarginReq,InitMarginReq,EquityWithLoanValue,NetLiquidationValue,ExcessLiquidity,BuyingPower,AvailableFunds";
-        String group = "All"; // Group é usado para contas gerenciadas
+        String group = "All";
 
-        client.reqAccountSummary(CRITICAL_MARGIN_REQ_ID, group, tags);
+        // 🎯 O PULLO DO GATO: Enviamos a requisição pesada pelo socket de conta
+        socketToUse.reqAccountSummary(CRITICAL_MARGIN_REQ_ID, group, tags);
 
-        log.info("📊 [Ponte | MARGEM] Solicitado sumário de margem crítico (Completo). ReqID: {}. Tags: {}",
-                CRITICAL_MARGIN_REQ_ID, tags);
+        log.info("📊 [DUAL-CHANNEL] Margem solicitada via CANAL 116 (Gestão). ReqID: {}.", CRITICAL_MARGIN_REQ_ID);
     }
 
     public void enviarOrdem(com.example.homegaibkrponte.model.Order ordemPrincipal) throws MarginRejectionException, OrdemFalhouException {
@@ -479,14 +538,32 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         } catch (Exception e) {
             String errorMessage = e.getMessage();
 
-            // 🛑 TRATAMENTO CRÍTICO DO ERRO 201 (MARGEM)
+            // 🛑 TRATAMENTO ESTRATÉGICO DO ERRO 201 (ESTRANGULAMENTO DE MARGEM)
             if (errorMessage != null && errorMessage.contains("201")) {
-                log.error("❌🚨 [Ponte IBKR | ERRO 201 MARGEM] Ordem {} rejeitada (Margem). Mensagem: {}",
-                        ordemPrincipal.symbol(), errorMessage, e);
-                throw new MarginRejectionException("Ordem rejeitada pela Corretora (IBKR Error 201). Liquidez não liberada.", e);
+
+                // ✅ BYPASS DE SEGURANÇA PARA VENDAS: Se o objetivo é SAIR, não podemos travar.
+                if (ordemPrincipal.isVenda()) {
+                    log.warn("🚨 [VETO-MARGEM-VENDA] {} rejeitada por Margem Inicial. Ativando Protocolo de Fragmentação...", ordemPrincipal.symbol());
+
+                    try {
+                        // Mapeia os objetos necessários para o reenvio
+                        com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
+                        com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
+
+                        // Dispara a lógica de redução agressiva (aquela que corta 70% no primeiro erro)
+                        tentarReenvioComReducao(ibkrOrder.orderId(), contract, ibkrOrder);
+
+                        return; // 🔄 Retorno silencioso: A Ponte assume a responsabilidade e o Principal continua operando.
+                    } catch (Exception ex) {
+                        log.error("💥 [ERRO-FATAL-RECOVERY] Falha ao iniciar mitigação para {}: {}", ordemPrincipal.symbol(), ex.getMessage());
+                    }
+                }
+
+                // Se for uma COMPRA, mantemos o bloqueio original para não afundar a conta
+                throw new MarginRejectionException("Erro 201: Margem insuficiente para abertura de nova posição.", e);
             }
 
-            log.error("🛑🛑🛑 [Ponte IBKR | ERRO GERAL] Falha ao enviar ordem {}. Mensagem: {}", ordemPrincipal.symbol(), errorMessage, e);
+            log.error("🛑🛑🛑 [Ponte IBKR | ERRO GERAL] Falha catastrófica na ordem {}. Mensagem: {}", ordemPrincipal.symbol(), errorMessage, e);
             throw new OrdemFalhouException("Falha na execução da ordem na Ponte IBKR.", e);
         }
     }
@@ -510,46 +587,117 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         return "Not available directly; check logs after connection.";
     }
 
-    // --- MÉTODOS MarketDataProvider (Lógica) ---
-    @Override public List<Candle> getHistoricalData(String symbol, int years) { return List.of(); }
+    @Override
+    public List<Candle> getHistoricalData(String symbol, int years) {
+        if (!isConnected()) return Collections.emptyList();
+
+        int reqId = getNextReqId();
+        CompletableFuture<List<Candle>> future = new CompletableFuture<>();
+
+        historicalFutures.put(reqId, future);
+        historicalDataBuffers.put(reqId, new ArrayList<>());
+        requestSymbols.put(reqId, symbol);
+
+        try {
+            // 1. Configurar Contrato com Roteamento Regional
+            Contract contract = new Contract();
+            String cleanSymbol = symbol.contains(".") ? symbol.split("\\.")[0] : symbol;
+            contract.symbol(cleanSymbol);
+            contract.secType("STK");
+
+            if (symbol.endsWith(".T")) {
+                contract.exchange("TSEJ");
+                contract.currency("JPY");
+            } else if (symbol.endsWith(".KS")) {
+                contract.exchange("KRX");
+                contract.currency("KRW");
+            } else if (symbol.endsWith(".HK")) {
+                contract.exchange("SEHK");
+                contract.currency("HKD");
+            } else {
+                contract.exchange("SMART");
+                contract.currency("USD");
+            }
+
+            // 2. CORREÇÃO DO ERRO 10314: String vazia assume o "Agora"
+            String endDateTime = "";
+
+            // 3. AJUSTE DINÂMICO: Removemos a trava de "1 Y".
+            // Agora o durationStr usa exatamente o valor do parâmetro 'years'.
+            // Ex: Se o Principal pedir 14, aqui será montado "14 Y".
+            String durationStr = years + " Y";
+
+            log.info("📡 [PONTE-SOCKET] Solicitando {} de histórico real para {} (ReqId: {})", durationStr, symbol, reqId);
+
+            // 4. Disparar Requisição
+            // Nota: O parâmetro "1 day" permite que a IBKR entregue muitos anos de uma só vez.
+            client.reqHistoricalData(reqId, contract, endDateTime, durationStr, "1 day", "TRADES", 1, 1, false, null);
+
+            // 5. Aguarda a resposta (30s é seguro para grandes volumes de dados)
+            return future.get(60, TimeUnit.SECONDS);
+
+        } catch (TimeoutException e) {
+            log.error("⏳ [TIMEOUT-CRÍTICO] A TWS demorou mais de 60s para enviar 14 anos de {}.", symbol);
+            return Collections.emptyList();
+        } catch (Exception e) {
+            log.error("⏳ [ERROR] Falha ao obter histórico para {}: {}", symbol, e.getMessage());
+            return Collections.emptyList();
+        }
+    }
 
     @Override
     public void connect() {
-        if (client.isConnected()) {
-            log.warn("⚠️ Já conectado. Ignorando novo pedido de conexão.");
+        if (client.isConnected() && accountClient.isConnected()) {
+            log.warn("⚠️ Ambos os canais já estão conectados.");
             return;
         }
+
         try {
-            log.info("📡 Conectando ao TWS/IB Gateway em {}:{} com Cliente ID: {}",
-                    ibkrProps.host(), ibkrProps.port(), ibkrProps.clientId());
+            String host = ibkrProps.host();
+            int port = ibkrProps.port();
 
-            client.eConnect(ibkrProps.host(), ibkrProps.port(), ibkrProps.clientId());
+            // 📡 CANAL 115: MARKET DATA (TICKS)
+            log.info("📡 [CANAL 115] Conectando para PREÇOS em {}:{}", host, port);
+            client.eConnect(host, port, 115);
+            startMsgProcessor(client, readerSignal, "ibkr-market-processor");
 
-            final EReader reader = new EReader(client, readerSignal);
-            reader.start();
+            // ⏳ PAUSA DE SINERGIA: Essencial para evitar o erro 502 da TWS ao conectar múltiplos IDs
+            log.info("⏳ Aguardando estabilização para conectar canal de GESTÃO...");
+            Thread.sleep(500);
 
-            // BLOCO CRÍTICO: Thread de processamento de mensagens
-            new Thread(() -> {
-                while (client.isConnected()) {
-                    readerSignal.waitForSignal();
-                    try {
-                        reader.processMsgs();
-                    } catch (java.lang.NoClassDefFoundError ncdfe) {
-                        log.error("🛑 ERRO FATAL DE CLASSPATH! Versão do Protobuf incompatível. MANTENDO CONEXÃO.", ncdfe);
-                    } catch (Exception e) {
-                        log.error("💥 EXCEPTION TWS: Thread de processamento de mensagens falhou: {}", e.getMessage(), e);
-                        break;
-                    }
-                }
-            },
-                    "ibkr-msg-processor").start();
+            // 📡 CANAL 116: GESTÃO (CONTA/ORDENS)
+            log.info("📡 [CANAL 116] Conectando para GESTÃO em {}:{}", host, port);
+            accountClient.eConnect(host, port, 116);
+            startMsgProcessor(accountClient, accountReaderSignal, "ibkr-account-processor");
 
             connectionLatch.await(10, TimeUnit.SECONDS);
+            log.info("✅ [DUAL-CHANNEL] Sincronização de canais concluída com sucesso.");
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            log.error("❌ Conexão interrompida durante a pausa de sinergia.");
         } catch (Exception e) {
-            log.error("💥 Falha na conexão com IBKR: {}", e.getMessage(), e);
+            log.error("💥 Falha na conexão dual com IBKR: {}", e.getMessage());
         }
+    }
+    /**
+     * Helper para rodar os processadores de mensagens em threads separadas.
+     * Isso garante que o processamento do Canal 116 não trave o Canal 115.
+     */
+    private void startMsgProcessor(EClientSocket socket, EReaderSignal signal, String threadName) {
+        final EReader reader = new EReader(socket, signal);
+        reader.start();
+        new Thread(() -> {
+            while (socket.isConnected()) {
+                signal.waitForSignal();
+                try {
+                    reader.processMsgs();
+                } catch (Exception e) {
+                    log.error("💥 EXCEPTION TWS [{}]: Thread falhou: {}", threadName, e.getMessage());
+                    break;
+                }
+            }
+        }, threadName).start();
     }
 
     @Override
@@ -705,8 +853,10 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             log.error("💥 [PONTE | SINERGIA] Falha CRÍTICA ao processar Execution Report (ID {}). Causa: {}", execution.orderId(), e.getMessage());
         }
     }
+
     /**
-     * ✅ Implementação CRÍTICA do error do EWrapper.
+     * ✅ Implementação CRÍTICA do error do EWrapper (Estrutura Original Restaurada).
+     * Resolve o conflito de login duplicado e garante a fluidez do mercado asiático.
      */
     @Override
     public void error(int id, long time, int errorCode, String errorMsg, String advancedOrderRejectJson) {
@@ -715,36 +865,68 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             log.debug("🔍 [DIAGNÓSTICO TWS RAW] ID: {} | CÓDIGO: {} | MENSAGEM: {} | JSON: {}",
                     id, errorCode, errorMsg, advancedOrderRejectJson);
 
-            // --- 2. TRATAMENTO DE SIMULAÇÕES WHAT-IF PENDENTES ---
-            CompletableFuture<OrderStateDTO> whatIfFuture = whatIfFutures.get(id);
-            if (whatIfFuture != null) {
+            // 🛡️ ROTA SEGURA: Tratamento de Conflito de Login (IP Duplicado)
+            // Erros de IP (162), Sessões Simultâneas (10197) ou Requisição Inválida (321)
+            if (errorCode == 162 || errorCode == 321 || errorCode == 10197) {
+                log.error("⚠️ [BLOQUEIO-IBKR] Corretora recusou ReqId {}: {}. Verifique se há outra sessão aberta!", id, errorMsg);
+
+                // AÇÃO CRÍTICA: Destrava imediatamente pedidos de HISTÓRICO (Warmup)
+                // Isso evita que o Principal fique travado no boot se a IBKR bloquear os dados.
+                CompletableFuture<List<Candle>> historicalFuture = historicalFutures.remove(id);
+                if (historicalFuture != null) {
+                    log.warn("🔓 [DESTRAVA-EMERGÊNCIA] Liberando thread do Principal com lista vazia para ativar Modo Híbrido.");
+                    historicalFuture.complete(Collections.emptyList());
+                }
+
+                // Destrava pedidos de WHAT-IF (Simulação de Margem)
+                CompletableFuture<OrderStateDTO> whatIfFuture = whatIfFutures.remove(id);
+                if (whatIfFuture != null) {
+                    whatIfFuture.completeExceptionally(new RuntimeException("IBKR_CONFLITO_SESSION: " + errorMsg));
+                }
+
+                // Limpeza de buffers residuais
+                historicalDataBuffers.remove(id);
+                requestSymbols.remove(id);
+
+                // Notifica o Principal via Webhook sobre a "cegueira" de dados
+                if (id > 0) {
+                    webhookNotifier.sendOrderRejection(id, errorCode, "RESPOSTA DEFINITIVA: " + errorMsg);
+                }
+                return;
+            }
+
+            // --- 2. TRATAMENTO DE SIMULAÇÕES WHAT-IF GERAIS ---
+            CompletableFuture<OrderStateDTO> generalWhatIfFuture = whatIfFutures.get(id);
+            if (generalWhatIfFuture != null) {
                 whatIfFutures.remove(id);
-                log.error("❌ [PONTE | What-If ERRO FATAL] ID: {} | CÓDIGO: {} | Mensagem: '{}'", id, errorCode, errorMsg);
-                whatIfFuture.completeExceptionally(new RuntimeException("Simulação What-If Falhou: " + errorMsg));
+                log.error("❌ [PONTE | What-If ERRO] ID: {} | CÓDIGO: {} | Mensagem: '{}'", id, errorCode, errorMsg);
+                generalWhatIfFuture.completeExceptionally(new RuntimeException("Simulação What-If Falhou: " + errorMsg));
                 return;
             }
 
             // --- 3. TRATAMENTO DE ERROS DE CONEXÃO E SISTEMA (ID < 0) ---
             if (id < 0) {
-                handleSystemErrors(errorCode, errorMsg);
+                if (errorCode == 2104 || errorCode == 2158 || errorCode == 2106) {
+                    log.info("✅ [TWS-IN] STATUS DE CONEXÃO: Código {}", errorCode);
+                } else {
+                    log.warn("🟡 [TWS-IN] INFO/AVISO: Código {} - {}", errorCode, errorMsg);
+                }
                 return;
             }
 
             // --- 4. 🧠 SINERGIA E AUTONOMIA: LIMPEZA DE CAPITAL IMEDIATA ---
-            // Resolve o problema do "Poder de Compra Fantasma"
-            // Independentemente do tipo de erro, devolve o capital reservado ao Buying Power.
+            // Se a ordem falhou por qualquer erro, devolvemos o dinheiro reservado ao Buying Power.
             portfolioService.removePendingOrder(String.valueOf(id));
 
             // --- 5. 🚀 AUTO-CORREÇÃO DE ID (Resolução do Erro 103) ---
-            // Se o erro for ID duplicado, força o salto de segurança sem intervenção manual.
             if (errorCode == 103) {
-                log.warn("🔄 [ID-RECOVERY] Erro 103 detectado para ordem {}. Aplicando salto automático no OrderIdManager.", id);
-                orderIdManager.initializeOrUpdate(id + 1000); // Salto preventivo imediato
+                log.warn("🔄 [ID-RECOVERY] Erro 103 detectado. Salto preventivo automático no OrderIdManager.");
+                orderIdManager.initializeOrUpdate(id + 1000);
             }
 
             // --- 6. TRATAMENTO DE REJEIÇÃO POR MARGEM (Erro 201 ou 10243) ---
             if (errorCode == 201 || errorCode == 10243) {
-                log.error("🛑🚨 [MARGEM] Rejeição detectada no ID {}: {}. Iniciando recuperação...", id, errorMsg);
+                log.error("🛑🚨 [MARGEM] Rejeição detectada no ID {}. Iniciando mitigação original...", id);
 
                 com.ib.client.Order orderFalha = lastOrdersCache.get(id);
                 com.ib.client.Contract contractFalha = lastContractsCache.get(id);
@@ -752,11 +934,9 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
                 if (orderFalha != null && contractFalha != null) {
                     lastOrdersCache.remove(id);
                     lastContractsCache.remove(id);
+                    webhookNotifier.sendOrderRejection(id, errorCode, "Margem insuficiente. Reduzindo lote...");
 
-                    // Notifica o Principal sobre a redução adaptativa
-                    webhookNotifier.sendOrderRejection(id, errorCode, "Margem insuficiente. Reduzindo lote em 40%...");
-
-                    // Dispara a lógica de redução agressiva (Step-Down)
+                    // Chama a sua lógica original de redução de lote
                     tentarReenvioComReducao(id, contractFalha, orderFalha);
                 } else {
                     log.error("❌ [RECOVERY ABORT] Ordem ID {} não encontrada para redução automática.", id);
@@ -766,14 +946,15 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             }
 
             // --- 7. NOTIFICAÇÃO DE ERROS SIGNIFICATIVOS AO PRINCIPAL ---
-            if (isSignificantError(errorCode)) {
+            if (errorCode != 2109 && errorCode != 2106 && errorCode != 2107 && errorCode != 2100) {
                 webhookNotifier.sendOrderRejection(id, errorCode, errorMsg);
             }
 
         } catch (Exception e) {
-            log.error("💥 [PONTE | ERROR CALLBACK] Falha fatal no tratamento automático: {}", e.getMessage(), e);
+            log.error("💥 [PONTE | ERROR CALLBACK] Falha fatal no tratamento: {}", e.getMessage(), e);
         }
     }
+
 
     private void handleSystemErrors(int errorCode, String errorMsg) {
         if (errorCode == 2104 || errorCode == 2158 || errorCode == 2106) {
@@ -964,7 +1145,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     @Override public void error(Exception e) { log.error("Exception IBKR: {}", e.getMessage(), e); }
     @Override public void error(String msg) { log.error("String Error IBKR: {}", msg); }
     @Override public void historicalDataUpdate(int reqId, Bar bar) {}
-    @Override public void historicalData(int reqId, Bar bar) {}
     @Override public void scannerParameters(String s) {}
     @Override public void scannerData(int i, int i1, ContractDetails contractDetails, String s, String s1, String s2, String s3) {}
     @Override public void scannerDataEnd(int i) {}
@@ -974,48 +1154,99 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     @Override public void deltaNeutralValidation(int i, DeltaNeutralContract deltaNeutralContract) {}
     @Override public void tickSnapshotEnd(int i) {}
     @Override public void marketDataType(int i, int i1) {}
-    @Override public void historicalDataEnd(int reqId, String startDateStr, String endDateStr) {}
+
+
     @Override public void openOrderEnd() {}
     @Override public void updateAccountTime(String var1) {}
     @Override public void accountDownloadEnd(String var1) {}
 
+
     @Override
-    public void tickPrice(int var1, int var2, double var3, TickAttrib var5) {
-        try {
-            final int tickerId = var1;
-            final int field = var2;
-            final double price = var3;
+    public void historicalData(int reqId, Bar bar) {
+        List<Candle> buffer = historicalDataBuffers.get(reqId);
+        String symbol = requestSymbols.get(reqId);
 
-            if (price <= 0 || price == Double.MAX_VALUE) {
-                log.trace("⚠️ TICK PRICE descartado: Preço inválido ({}) para ID: {}.", price, tickerId);
-                return;
+        if (buffer != null) {
+            try {
+                LocalDateTime dateTime;
+                String rawTime = bar.time();
+
+                // A IBKR retorna "yyyyMMdd" para barras de 1 dia.
+                // Se houver espaço ou for mais longo, tratamos como DateTime.
+                if (rawTime.contains("  ")) {
+                    dateTime = LocalDateTime.parse(rawTime, DateTimeFormatter.ofPattern("yyyyMMdd  HH:mm:ss"));
+                } else if (rawTime.length() == 8) {
+                    dateTime = LocalDate.parse(rawTime, DateTimeFormatter.ofPattern("yyyyMMdd")).atStartOfDay();
+                } else {
+                    // Fallback para outros formatos que o TWS possa enviar
+                    dateTime = LocalDateTime.parse(rawTime, DateTimeFormatter.ofPattern("yyyyMMdd HH:mm:ss"));
+                }
+
+                buffer.add(new Candle(
+                        symbol,
+                        dateTime,
+                        bar.open(),
+                        bar.high(),
+                        bar.low(),
+                        bar.close(),
+                        bar.volume().longValue()
+                ));
+
+                // Log de depuração a cada 100 candles para não inundar o console
+                if (buffer.size() % 100 == 0) {
+//                    log.debug("📥 [PONTE-DADO] Coletando candles para {}... Total: {}", symbol, buffer.size());
+                }
+
+            } catch (Exception e) {
+                log.warn("⚠️ [DATA-PARSE] Erro ao converter data '{}' do ativo {}: {}", bar.time(), symbol, e.getMessage());
             }
-
-            String symbol = marketDataRequests.get(tickerId);
-            if (symbol == null) {
-                log.warn("⚠️ TICK PRICE recebido para ID não rastreado: {}. Ignorado.", tickerId);
-                return;
-            }
-
-            // Apenas o preço LAST (Último) é o que interessa para o cache
-            if (field == TickType.LAST.index()) {
-                BigDecimal currentPrice = BigDecimal.valueOf(price);
-
-                // 1. ATUALIZA O CACHE LOCAL (CRÍTICO para o Market Data On-Demand!)
-                marketPriceCache.put(symbol.toUpperCase(), currentPrice);
-
-                // 2. Envia o webhook para o Principal
-                webhookNotifier.sendMarketTick(symbol, currentPrice);
-
-                log.debug("📢 [PONTE TICK] Preço LAST atualizado para {}: R$ {}. Webhook ENVIADO.", symbol, currentPrice.setScale(4, RoundingMode.HALF_UP));
-            } else if (field == TickType.BID.index() || field == TickType.ASK.index()) {
-                log.trace("📢 [PONTE TICK] Tick recebido ({}): {}", TickType.getField(field), symbol);
-            }
-        } catch (Exception e) {
-            log.error("💥 [Ponte IBKR] Falha ao processar tickPrice. Rastreando.", e);
         }
     }
 
+    @Override
+    public void historicalDataEnd(int reqId, String startDateStr, String endDateStr) {
+        List<Candle> data = historicalDataBuffers.get(reqId);
+        int total = (data != null) ? data.size() : 0;
+
+        log.info("✅ [PONTE-SOCKET] Carga histórica FINALIZADA para ReqId: {}. Total: {} candles coletados.", reqId, total);
+
+        CompletableFuture<List<Candle>> future = historicalFutures.get(reqId);
+        if (future != null) {
+            // Entrega a lista preenchida para o Controller (e consequentemente para o Principal)
+            future.complete(data != null ? data : Collections.emptyList());
+        }
+    }
+
+    // No IBKRConnector.java da PONTE
+    @Override
+    public void tickPrice(int tickerId, int field, double price, TickAttrib attribs) {
+        // 1. Filtro de segurança básico da IBKR
+        if (price <= 0 || price == Double.MAX_VALUE) return;
+
+        // 🚨 LOG DE EMERGÊNCIA: Monitora QUALQUER sinal vindo da TWS em tempo real
+        log.info("⚡ [TWS-RAW] Recebido ID: {} | Campo: {} | Preço: {}", tickerId, field, price);
+
+        String symbol = marketDataRequests.get(tickerId);
+        if (symbol == null) return;
+
+        // 🎯 FILTRO DE FLUXO CONTÍNUO:
+        // No Japão, o preço "Last" (4) demora a mudar.
+        // Capturamos Bid(1) e Ask(2) para garantir que o Oráculo no Principal tenha o preço mais recente.
+        if (field == 1 || field == 2 || field == 4 || field == 6 || field == 7 || field == 9) {
+
+            BigDecimal currentPrice = BigDecimal.valueOf(price);
+
+            // 🚀 ENVIO PARA O PRINCIPAL (Aqui ocorre a sinergia com o Webhook)
+            webhookNotifier.sendMarketTick(symbol, currentPrice);
+
+            // Log detalhado para confirmar o repasse com sucesso
+            log.info("🚀 [TICK-FLOW] {} -> {} {} (Field: {})",
+                    symbol,
+                    price,
+                    symbol.endsWith(".T") ? "JPY" : "USD",
+                    TickType.getField(field));
+        }
+    }
 
     @Override public void updateMktDepth(int i, int i1, int i2, int i3, double v, Decimal decimal) {}
     @Override public void updateMktDepthL2(int i, int i1, String s, int i2, int i3, double v, Decimal decimal, boolean b) {}
@@ -1106,7 +1337,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             // 3. LÓGICA DE SOBRESCRITA/ALERTAS (Net Liquidation Value e Chaves Críticas)
             // O NLV é importante para sobrescrever o valor interno e disparar a atualização de portfólio.
             if ("NetLiquidation".equalsIgnoreCase(tag) || "NetLiquidationValue".equalsIgnoreCase(tag)) {
-                log.info("⬅️ [PONTE | SUMMARY NLV] Capturado NLV. Enviando para setter dedicado: R$ {}", accountValue);
+                log.info("⬅️ [PONTE | SUMMARY NLV] Atualizando valor mestre (SSOT): R$ {}", accountValue);
                 portfolioService.updateNetLiquidationValueFromCallback(accountValue);
             } else if ("MaintMarginReq".equalsIgnoreCase(tag)) {
                 // Logs explicativos para acompanhamento do dado CRÍTICO (Obrigatório)
@@ -1134,12 +1365,12 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     public void accountSummaryEnd(int reqId) {
         try {
             // Verifica se este é o fim da requisição CRÍTICA
-            if (reqId == CRITICAL_MARGIN_REQ_ID) {
-                // O EL já deve ter sido recebido ou calculado pelo accountSummary()
-                log.error("🎉🎉 [PONTE | MARGEM CRÍTICA CONCLUÍDA] Fim do Account Summary de Margem (ReqID: {}). Dados de risco populados.", reqId);
-            }
+//            if (reqId == CRITICAL_MARGIN_REQ_ID) {
+//                // O EL já deve ter sido recebido ou calculado pelo accountSummary()
+//                log.error("🎉🎉 [PONTE | MARGEM CRÍTICA CONCLUÍDA] Fim do Account Summary de Margem (ReqID: {}). Dados de risco populados.", reqId);
+//            }
             // Lógica legada ou de limpeza
-            currentAccountSummaryReqId.compareAndSet(reqId, -1);
+//            currentAccountSummaryReqId.compareAndSet(reqId, -1);
         } catch (Exception e) {
             log.error("💥 [Ponte IBKR] Falha ao processar accountSummaryEnd {}. Rastreando.", reqId, e);
         }

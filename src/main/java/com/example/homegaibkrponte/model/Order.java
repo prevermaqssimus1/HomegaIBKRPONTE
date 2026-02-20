@@ -56,6 +56,17 @@ public record Order(
         return this.quantity.abs().multiply(this.price).setScale(2, RoundingMode.HALF_UP);
     }
 
+    public boolean isVenda() {
+        return this.side == OrderSide.SELL || this.side == OrderSide.SELL_SHORT;
+    }
+
+    /**
+     * ✅ MÉTODO COMPLEMENTAR: Identifica entradas.
+     */
+    public boolean isCompra() {
+        return this.side == OrderSide.BUY || this.side == OrderSide.BUY_TO_COVER;
+    }
+
     /**
      * Retorna uma nova instância de Order com o novo clientOrderId.
      */

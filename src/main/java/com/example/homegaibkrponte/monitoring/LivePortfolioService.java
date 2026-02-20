@@ -83,7 +83,7 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
     private static final String KEY_EXCESS_LIQUIDITY_NORMALIZED = "EXCESSLIQUIDITY";
     private static final String KEY_BUYING_POWER_NORMALIZED = "BUYINGPOWER";
 
-    @Value("${api.ibkr.account-id:U22445775}") // DUN... fica como fallback
+    @Value("${api.ibkr.account-id:DUN652604}") // DUN... fica como fallback
     private String accountId;
 
     // --- CHAVES DE MARGEM (AJUSTADAS PARA UPPERCASE, sinergia com o cache) ---

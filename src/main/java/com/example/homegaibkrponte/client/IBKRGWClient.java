@@ -24,20 +24,23 @@ public class IBKRGWClient {
     // ====================================================================
     // 1. MÉTODO DE VENDA (LIBERA MARGEM)
     // ====================================================================
-    public OrderExecutionResult placeSellOrder(String symbol, long quantity, String action, String reason) {
+    public OrderExecutionResult placeSellOrder(String symbol, long quantity, BigDecimal price, String action, String reason) {
         synchronized (orderQueueLock) {
             try {
+                // 🚨 VALIDAÇÃO DO PREÇO (O QUE ESTAVA DANDO ERRO)
+                if (price == null || price.signum() <= 0) {
+                    log.error("💥 [PONTE] Falha: Venda de {} requer preço válido (LMT/MKT-Prot).", symbol);
+                    return new OrderExecutionResult(false, "Ordem LMT requer preço válido.");
+                }
+
                 if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");
 
-                // 🛡️ AJUSTE CRÍTICO: Removido o veto de Excess Liquidity para VENDAS.
-                // Vender ativos reduz a Margem de Manutenção e ajuda a sair do negativo.
+                log.info("🔥 [PONTE IBKR | EXEC] Enviando VENDA de {} @ {} para restaurar liquidez.", symbol, price);
 
-                log.info("🔥 [PONTE IBKR | EXEC] Enviando VENDA de {} para restaurar liquidez. ID: {}", symbol, nextOrderId);
-
-                // Simulação da chamada de rede para a TWS/Gateway
+                // --- Aqui você chamaria o EClient da IBKR passando o price ---
                 Thread.sleep(50);
 
-                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem de venda enviada.");
+                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada.");
                 result.setOrderId(nextOrderId++);
                 return result;
             } catch (Exception e) {
@@ -50,26 +53,28 @@ public class IBKRGWClient {
     // ====================================================================
     // 2. MÉTODO DE COMPRA (CONSOME MARGEM)
     // ====================================================================
-    public OrderExecutionResult placeBuyOrder(String symbol, long quantity, String action, String reason) {
+    public OrderExecutionResult placeBuyOrder(String symbol, long quantity, BigDecimal price, String action, String reason) {
         synchronized (orderQueueLock) {
             try {
-                if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");
-
-                // 🚨 VETO RIGOROSO: Compra proibida se liquidez for zero ou negativa.
-                if (!isExcessLiquiditySufficient()) {
-                    log.error("🛑 [VETO COMPRA] Excess Liquidity insuficiente (R$ {}). Operação bloqueada.",
-                            portfolioService.getExcessLiquidity().toPlainString());
-                    return new OrderExecutionResult(false, "Liquidez insuficiente para novas compras.");
+                // 🚨 VALIDAÇÃO DO PREÇO
+                if (price == null || price.signum() <= 0) {
+                    return new OrderExecutionResult(false, "Ordem LMT requer preço válido.");
                 }
 
-                log.info("🚀 [PONTE IBKR | EXEC] Enviando COMPRA de {}. ID: {}", symbol, nextOrderId);
+                if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");
+
+                if (!isExcessLiquiditySufficient()) {
+                    log.error("🛑 [VETO COMPRA] EL insuficiente (R$ {}).", portfolioService.getExcessLiquidity());
+                    return new OrderExecutionResult(false, "Liquidez insuficiente.");
+                }
+
+                log.info("🚀 [PONTE IBKR | EXEC] Enviando COMPRA de {} @ {}.", symbol, price);
                 Thread.sleep(50);
 
-                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem de compra enviada.");
+                OrderExecutionResult result = new OrderExecutionResult(true, "Ordem enviada.");
                 result.setOrderId(nextOrderId++);
                 return result;
             } catch (Exception e) {
-                log.error("❌ [ERRO FATAL] Falha na compra de {}: {}", symbol, e.getMessage());
                 return new OrderExecutionResult(false, e.getMessage());
             }
         }

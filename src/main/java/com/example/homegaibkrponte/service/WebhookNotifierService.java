@@ -131,6 +131,32 @@ public class WebhookNotifierService {
     }
 
     /**
+     * 🚀 NOVO MÉTODO SINERGIZADO: Notifica rejeições enviando o ClientID real (String).
+     * Essencial para o Winston encontrar a reserva de capital e limpar o Buying Power.
+     */
+    public void sendOrderRejection(String clientOrderId, long brokerOrderId, int errorCode, String reason) {
+        // Usa o novo construtor que mapeia a String original do Winston
+        OrderRejectionDto rejection = new OrderRejectionDto(clientOrderId, brokerOrderId, errorCode, reason);
+        dispararPostRejection(rejection);
+    }
+
+    /**
+     * Helper privado para centralizar o envio e evitar repetição de lógica.
+     */
+    private void dispararPostRejection(OrderRejectionDto rejection) {
+        this.webClient.post()
+                .uri(REJECTION_URI)
+                .bodyValue(rejection)
+                .retrieve()
+                .toBodilessEntity()
+                .retryWhen(retrySpec)
+                .subscribe(
+                        success -> log.info("✅ [WEBHOOK-OUT] Rejeição entregue: {}", rejection.getClientOrderId()),
+                        err -> log.error("❌ [WEBHOOK-OUT] Falha ao entregar rejeição: {}", err.getMessage())
+                );
+    }
+
+    /**
      * Notifica execuções reais (FILL).
      */
     public void sendExecutionReport(ExecutionReportDto report) {

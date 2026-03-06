@@ -2,58 +2,35 @@ package com.example.homegaibkrponte.dto;
 
 import java.time.LocalDateTime;
 
-/**
- * DTO para representar uma rejeição crítica de ordem da corretora.
- *
- * SINERGIA CRÍTICA: Contém um construtor de 3 argumentos para ser
- * utilizado pelo WebhookNotifierService, adicionando o timestamp.
- */
 public class OrderRejectionDto {
-
-    private final long orderId; // O 'clientId' usado na Ponte, que é o Order ID do Principal.
-    private final int errorCode;
-    private final String errorMessage;
+    private final String clientOrderId; // 🎯 NOVO: Necessário para o Winston limpar o saldo
+    private final long orderId;        // Mantido
+    private final int errorCode;       // Mantido
+    private final String errorMessage; // Mantido
     private final LocalDateTime rejectionTime;
 
-    // CONSTRUTOR DE SINERGIA: Chamado pelo WebhookNotifierService (3 argumentos)
+    // CONSTRUTOR ORIGINAL (Mantém a compatibilidade com o que já funciona)
     public OrderRejectionDto(long orderId, int errorCode, String errorMessage) {
-        // Delega para o construtor principal, adicionando o timestamp atual
-        this(orderId, errorCode, errorMessage, LocalDateTime.now());
-    }
-
-    // CONSTRUTOR PRINCIPAL (4 argumentos - O DTO padrão)
-    public OrderRejectionDto(long orderId, int errorCode, String errorMessage, LocalDateTime rejectionTime) {
+        this.clientOrderId = String.valueOf(orderId); // Fallback
         this.orderId = orderId;
         this.errorCode = errorCode;
         this.errorMessage = errorMessage;
-        this.rejectionTime = rejectionTime;
+        this.rejectionTime = LocalDateTime.now();
     }
 
-    // Getters (Apenas getters são necessários para um DTO de envio)
-    public long getOrderId() {
-        return orderId;
+    // NOVO CONSTRUTOR (Para quando a Ponte sabe o ClientID real do Winston)
+    public OrderRejectionDto(String clientOrderId, long orderId, int errorCode, String errorMessage) {
+        this.clientOrderId = clientOrderId;
+        this.orderId = orderId;
+        this.errorCode = errorCode;
+        this.errorMessage = errorMessage;
+        this.rejectionTime = LocalDateTime.now();
     }
 
-    public int getErrorCode() {
-        return errorCode;
-    }
-
-    public String getErrorMessage() {
-        return errorMessage;
-    }
-
-    public LocalDateTime getRejectionTime() {
-        return rejectionTime;
-    }
-
-    // Opcional: toString para logs
-    @Override
-    public String toString() {
-        return "OrderRejectionDto{" +
-                "orderId=" + orderId +
-                ", errorCode=" + errorCode +
-                ", errorMessage='" + errorMessage + '\'' +
-                ", rejectionTime=" + rejectionTime +
-                '}';
-    }
+    // Getters mantidos para não quebrar a serialização
+    public String getClientOrderId() { return clientOrderId; }
+    public long getOrderId() { return orderId; }
+    public int getErrorCode() { return errorCode; }
+    public String getErrorMessage() { return errorMessage; }
+    public LocalDateTime getRejectionTime() { return rejectionTime; }
 }

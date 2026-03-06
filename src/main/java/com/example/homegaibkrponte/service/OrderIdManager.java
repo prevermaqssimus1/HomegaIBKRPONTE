@@ -26,6 +26,9 @@ public class OrderIdManager {
     // 🧠 MEMÓRIA DE TRADUÇÃO: Chave: ClientOrderId (String) -> Valor: IBKR OrderId (Integer)
     private final Map<String, Integer> idMapping = new ConcurrentHashMap<>();
 
+    private final Map<Integer, String> reverseMapping = new ConcurrentHashMap<>();
+
+
     /**
      * Sincroniza o ID com Salto de Segurança.
      */
@@ -44,7 +47,8 @@ public class OrderIdManager {
     public void linkIds(String clientOrderId, int ibkrOrderId) {
         if (clientOrderId != null) {
             idMapping.put(clientOrderId, ibkrOrderId);
-            log.debug("🔗 [OrderIdManager] Vinculado: {} -> {}", clientOrderId, ibkrOrderId);
+            reverseMapping.put(ibkrOrderId, clientOrderId); // 🎯 Salva o caminho de volta
+            log.debug("🔗 [OrderIdManager] Vinculado: {} <-> {}", clientOrderId, ibkrOrderId);
         }
     }
 
@@ -56,11 +60,22 @@ public class OrderIdManager {
     }
 
     /**
-     * 🧹 LIMPEZA: Remove do mapa após conclusão ou cancelamento.
+     * 🔍 BUSCA CLIENT ID: O método que a Ponte precisa para o estorno de saldo.
+     * Recupera a String (ex: WNS-TSLA...) usando o número da IBKR.
      */
+    public String getClientOrderId(int ibkrOrderId) {
+        // Se encontrar a String original, retorna ela.
+        // Se não encontrar, retorna o número como String para não quebrar o código.
+        return reverseMapping.getOrDefault(ibkrOrderId, String.valueOf(ibkrOrderId));
+    }
+
+
     public void removeMapping(String clientOrderId) {
         if (clientOrderId != null) {
-            idMapping.remove(clientOrderId);
+            Integer ibkrId = idMapping.remove(clientOrderId);
+            if (ibkrId != null) {
+                reverseMapping.remove(ibkrId);
+            }
         }
     }
 

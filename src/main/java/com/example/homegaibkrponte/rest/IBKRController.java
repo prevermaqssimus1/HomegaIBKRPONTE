@@ -328,7 +328,7 @@ public class IBKRController {
      */
     @PostMapping("/subscribe")
     public ResponseEntity<Void> subscribeMarketData(@RequestParam(name = "symbol") String symbol) {
-        log.info("📡 [PONTE-API] Comando de subscrição recebido para: {}", symbol);
+//        log.info("📡 [PONTE-API] Comando de subscrição recebido para: {}", symbol);
 
         if (symbol == null || symbol.isEmpty()) {
             return ResponseEntity.badRequest().build();

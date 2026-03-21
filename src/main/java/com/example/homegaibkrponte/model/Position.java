@@ -66,10 +66,6 @@ public final class Position {
             @JsonProperty("contractDetails") Map<String, String> contractDetails,
             @JsonProperty("isEmergencyLiquidityCandidate") Boolean isEmergencyLiquidityCandidate
     ) {
-        // --- VALIDAÇÃO BÁSICA (PRESERVAÇÃO) ---
-        if (quantity == null || quantity.compareTo(BigDecimal.ZERO) < 0) {
-            throw new IllegalArgumentException("Quantidade deve ser positiva.");
-        }
 
         // --- INICIALIZAÇÃO DE TODOS OS CAMPOS ---
         this.symbol = symbol;

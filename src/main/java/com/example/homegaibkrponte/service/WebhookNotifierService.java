@@ -97,22 +97,39 @@ public class WebhookNotifierService {
     }
 
     /**
-     * 🎌 ENVIO DE TICK REAL-TIME (Diferencia Japão .T de EUA)
+     * 🎌 ENVIO DE TICK REAL-TIME EVOLUÍDO (Oráculo v3.0)
+     * Agora transporta bid, ask e volume para análise de microestrutura.
      */
-    // No WebhookNotifierService.java (PONTE)
-    public void sendMarketTick(String symbol, BigDecimal price) {
-        String currency = symbol.endsWith(".T") ? "JPY" : "USD";
-        MarketTickDTO tick = new MarketTickDTO(symbol, price, currency);
+    public void sendMarketTick(String symbol, BigDecimal price, BigDecimal bid, BigDecimal ask, Long size) {
+        // 🛡️ Validação de sanidade para evitar nulidade no Ring Buffer do Principal
+        BigDecimal validBid = (bid != null) ? bid : price;
+        BigDecimal validAsk = (ask != null) ? ask : price;
+        Long validSize = (size != null) ? size : 0L;
+        Long timestamp = System.currentTimeMillis();
+
+        // Criamos o DTO completo com o novo contrato
+        MarketTickDTO tick = new MarketTickDTO(
+                symbol,
+                price,
+                validBid,
+                validAsk,
+                validSize,
+                timestamp
+        );
 
         this.webClient.post()
-                .uri("/api/bridge/data/tick") // Certifique-se que o Principal tem este @PostMapping
+                .uri(MARKET_TICK_URI) // Rota: /api/bridge/data/tick
                 .bodyValue(tick)
                 .retrieve()
+                .onStatus(HttpStatusCode::isError, response -> {
+                    log.trace("⚠️ [TICK-DROP] Falha na entrega para {}. Status: {}", symbol, response.statusCode());
+                    return Mono.empty();
+                })
                 .toBodilessEntity()
-                .timeout(Duration.ofMillis(500)) // 🛡️ ROTA SEGURA: Não trava se o Principal estiver lento
+                .timeout(Duration.ofMillis(300)) // 🛡️ ROTA SNIPER: Latência reduzida para 300ms
                 .subscribe(
-                        null,
-                        err -> log.trace("Tick dropado para evitar travamento.")
+                        success -> {}, // Sucesso silencioso para não poluir logs de alta frequência
+                        err -> log.trace("Tick de {} dropado por timeout ou rede.", symbol)
                 );
     }
 

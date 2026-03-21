@@ -81,45 +81,76 @@ public class OrderService {
     private OrderDTO handleSimpleOrder(OrderDTO orderDto, boolean isReduction) {
         int tempId = orderIdManager.getNextOrderId();
         Contract contract = contractFactory.create(orderDto.symbol());
-        Order ibkrOrder = orderFactory.create(orderDto, String.valueOf(tempId));
 
-        // ✅ REGRA DE OURO: Se for DELEVERAGING, pula a simulação que trava a META
-        if (isReduction) {
-            log.warn("🛡️ [PONTE | PRIORIDADE] Ordem de mitigação para {} detectada. Ignorando simulação What-If para destravar a conta.", orderDto.symbol());
-            int finalOrderId = orderIdManager.getNextOrderId();
-            ibkrOrder.orderId(finalOrderId);
+        // 🎯 [AUDITORIA-P1] CAPTURA DE PREÇO REAL PARA EXECUÇÃO
+        BigDecimal executionPrice = portfolioService.getPriceForOrder(orderDto.symbol());
 
-            // 🔗 SINERGIA: Mapeia o ID para permitir cancelamento/purga posterior
-            orderIdManager.linkIds(orderDto.clientOrderId(), finalOrderId);
-
-            connector.placeOrder(finalOrderId, contract, ibkrOrder);
-            return orderDto.withOrderId(finalOrderId);
+        // 🛡️ SINERGIA: Blindagem contra Drift de Preço (Usando o novo método withPrice)
+        OrderDTO finalDto = orderDto;
+        if (orderDto.price() == null || orderDto.price().signum() <= 0) {
+            log.warn("⚠️ [RECOVERY-PRICE] {} chegou sem preço. Injetando Snapshot: ${}", orderDto.symbol(), executionPrice);
+            finalDto = orderDto.withPrice(executionPrice);
         }
 
+        // Criação do objeto de ordem da IBKR
+        Order ibkrOrder = orderFactory.create(finalDto, String.valueOf(tempId));
+
+        // ✅ REGRA DE OURO: Se for REDUÇÃO/SHORT-COVER, pula a simulação
+        if (isReduction) {
+            log.warn("🛡️ [PONTE | PRIORIDADE] Ordem de mitigação para {} detectada. Ignorando What-If.", finalDto.symbol());
+            int finalOrderId = orderIdManager.getNextOrderId();
+            ibkrOrder.orderId(finalOrderId);
+            orderIdManager.linkIds(finalDto.clientOrderId(), finalOrderId);
+
+            // 📊 Auditoria de Custo Final
+            BigDecimal custoReal = finalDto.quantity().multiply(executionPrice).abs();
+            log.info("📦 [TWS-OUT-PRIORITY] {} | Qtd: {} | Preço: ${} | Custo Est: ${}",
+                    finalDto.symbol(), finalDto.quantity(), executionPrice, custoReal);
+
+            // Registra o capital antes de enviar
+            portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(), finalDto.quantity(), executionPrice);
+
+            connector.placeOrder(finalOrderId, contract, ibkrOrder);
+            return finalDto.withOrderId(finalOrderId);
+        }
+
+        // 🚀 FLUXO PARA NOVAS ENTRADAS
         try {
-            log.info("🔍 [PRE-CHECK] Simulando margem para compra de {} (ID: {})", orderDto.symbol(), tempId);
+            log.info("🔍 [PRE-CHECK] Simulando margem para {} (ID: {})", finalDto.symbol(), tempId);
             boolean temMargem = connector.validarMargemPreventiva(contract, ibkrOrder);
 
             int finalOrderId = orderIdManager.getNextOrderId();
             ibkrOrder.orderId(finalOrderId);
-
-            // 🔗 SINERGIA: Mapeia o ID definitivo antes do envio real
-            orderIdManager.linkIds(orderDto.clientOrderId(), finalOrderId);
+            orderIdManager.linkIds(finalDto.clientOrderId(), finalOrderId);
 
             if (!temMargem) {
                 double qtdOriginal = ibkrOrder.totalQuantity().value().doubleValue();
                 double novaQtd = Math.floor(qtdOriginal * 0.60);
                 String elProjetado = connector.getLastWhatIfExcessLiquidity();
-                log.warn("📉 [ADAPTIVE-SIZE] Margem insuficiente. Reduzindo lote: {} -> {} | EL: {}", qtdOriginal, novaQtd, elProjetado);
-                ibkrOrder.totalQuantity(Decimal.get(novaQtd));
-                webhookNotifier.sendAdaptiveCheckAlert(orderDto.symbol(), qtdOriginal, novaQtd, elProjetado);
+
+                log.warn("📉 [ADAPTIVE-SIZE] Margem insuficiente para {}. Reduzindo: {} -> {} | EL: {}",
+                        finalDto.symbol(), qtdOriginal, novaQtd, elProjetado);
+
+                ibkrOrder.totalQuantity(com.ib.client.Decimal.get(novaQtd));
+                webhookNotifier.sendAdaptiveCheckAlert(finalDto.symbol(), qtdOriginal, novaQtd, elProjetado);
             }
 
+            // 📊 Auditoria de Custo Real
+            BigDecimal custoReal = BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue())
+                    .multiply(executionPrice).abs();
+
+            log.info("📦 [TWS-OUT] Despachando {} | Qtd Final: {} | Preço: ${} | Custo: ${}",
+                    finalDto.symbol(), ibkrOrder.totalQuantity().value(), executionPrice, custoReal);
+
+            // Registra o capital antes de enviar
+            portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(), finalDto.quantity(), executionPrice);
+
             connector.placeOrder(finalOrderId, contract, ibkrOrder);
-            return orderDto.withOrderId(finalOrderId);
+            return finalDto.withOrderId(finalOrderId);
+
         } catch (Exception e) {
-            log.error("💥 [FATAL] Erro no fluxo preventivo para {}: {}", orderDto.symbol(), e.getMessage());
-            throw new RuntimeException(e);
+            log.error("💥 [FATAL-ORDER-FLOW] Erro ao processar {}: {}", finalDto.symbol(), e.getMessage());
+            throw new RuntimeException("Falha no fluxo de ordem da Ponte", e);
         }
     }
 

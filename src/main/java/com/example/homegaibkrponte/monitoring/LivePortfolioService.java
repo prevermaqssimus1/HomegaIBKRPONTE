@@ -13,8 +13,10 @@ import com.example.homegaibkrponte.model.PosicaoAvaliada;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
@@ -78,6 +80,8 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
     // 🛑 CORREÇÃO/NOVO: Variável faltante, inicializada como BRL (moeda brasileira) para evitar NullPointer/erro de compilação.
     private final AtomicReference<String> accountCurrency = new AtomicReference<>("BRL");
 
+    private final IBKRConnector ibkrConnector;
+
     // 🛑 CHAVES NORMALIZADAS (Para garantir consistência)
     private static final String KEY_NET_LIQUIDATION_NORMALIZED = "NETLIQUIDATION";
     private static final String KEY_EXCESS_LIQUIDITY_NORMALIZED = "EXCESSLIQUIDITY";
@@ -100,11 +104,12 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
 
 
     // --- CONSTRUTOR ---
-    public LivePortfolioService(ApplicationEventPublisher eventPublisher) {
+    @Autowired
+    public LivePortfolioService(ApplicationEventPublisher eventPublisher, @Lazy IBKRConnector ibkrConnector) {
         this.eventPublisher = eventPublisher;
-        log.info("LivePortfolioService (Ponte) inicializado. Latch de Margem: {}", criticalMarginDataLatch.getCount());
+        this.ibkrConnector = ibkrConnector;
+        log.info("LivePortfolioService (Ponte) inicializado.");
     }
-
     @PostConstruct
     public void init() {
         lastAccountBalance.set(new AccountBalance(BigDecimal.valueOf(initialCapital), LocalDateTime.now()));
@@ -124,20 +129,81 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
-    public void trackOrderSent(String clientOrderId, BigDecimal quantity, BigDecimal price) {
+    public void trackOrderSent(String clientOrderId, String symbol, BigDecimal quantity, BigDecimal price) {
         try {
-            BigDecimal estimatedCost = quantity.abs().multiply(price);
+            // Se o preço chegar zerado, tenta um último resgate pelo símbolo
+            BigDecimal finalPrice = (price == null || price.signum() <= 0)
+                    ? getPriceForOrder(symbol)
+                    : price;
+
+            BigDecimal estimatedCost = quantity.abs().multiply(finalPrice);
             flightOrders.put(clientOrderId, estimatedCost);
 
-            log.info("📝 [TRACKING] Capital Reservado: {} | Custo Est: R$ {} | Pendentes: {}",
-                    clientOrderId, estimatedCost.setScale(2, RoundingMode.HALF_UP), flightOrders.size());
+            log.warn("📝 [TRACKING] {} | Capital Reservado: ${} | Preço Ref: ${} | Pendentes: {}",
+                    symbol, estimatedCost.setScale(2, RoundingMode.HALF_UP), finalPrice, flightOrders.size());
 
-            // Força a atualização do BP ajustado no snapshot
+            // Atualiza o Buying Power
             BigDecimal currentBP = accountValuesCache.getOrDefault(KEY_BUYING_POWER, BigDecimal.ZERO);
             handleBuyingPowerUpdate(currentBP);
 
         } catch (Exception e) {
             log.error("❌ Erro ao rastrear ordem {} no Portfólio: {}", clientOrderId, e.getMessage());
+        }
+    }
+    /**
+     * 🚀 RESGATE DE PREÇO REAL (V30.1 - PROTOCOLO SNAPSHOT)
+     * Se o cache de ticks interno estiver zerado, força um snapshot síncrono na TWS.
+     * Isso elimina o erro [MARKET DATA ERROR] e o Custo R$ 0.00.
+     */
+    public BigDecimal getPriceForOrder(String symbol) {
+        if (symbol == null) return BigDecimal.ZERO;
+
+        String priceKey = symbol.toUpperCase() + "_PRICE";
+
+        // 1. Tenta buscar do cache de mapa (SSOT) alimentado pelo streaming
+        BigDecimal price = accountValuesCache.get(priceKey);
+
+        // 2. 💎 VÁLVULA DE RESGATE: Se não há tick, solicita SNAPSHOT síncrono na TWS
+        if (price == null || price.signum() <= 0) {
+            log.warn("📡 [PRICE-RECOVERY] {} sem tick no cache. Solicitando SNAPSHOT físico à corretora...", symbol);
+
+            try {
+                // Chama o método síncrono no conector (implementação sugerida abaixo)
+                price = ibkrConnector.fetchMarketDataSnapshot(symbol);
+
+                if (price != null && price.signum() > 0) {
+                    // Alimenta o cache para evitar novas chamadas imediatas
+                    accountValuesCache.put(priceKey, price);
+                    log.info("✅ [PRICE-SNAPSHOT] {} recuperado com sucesso: ${}", symbol, price);
+                }
+            } catch (Exception e) {
+                log.error("❌ [SNAPSHOT-FAILED] Erro ao buscar preço para {}: {}", symbol, e.getMessage());
+            }
+        }
+
+        return (price != null && price.signum() > 0) ? price : BigDecimal.ZERO;
+    }
+
+    /**
+     * 🩹 [ESTORNO-IMEDIATO] Método de Sinergia com o Principal.
+     * Chamado pelo IBKRConnector ao detectar rejeição/erro da corretora (Erro 201/203).
+     * Remove a ordem do cache 'flightOrders' para que o BP ajustado seja recuperado na hora.
+     */
+    public void removePendingOrderById(String clientOrderId) {
+        if (clientOrderId == null || clientOrderId.equals("0")) {
+            return;
+        }
+
+        // 1. Remove do mapa de ordens em voo
+        BigDecimal custoRemovido = flightOrders.remove(clientOrderId);
+
+        if (custoRemovido != null) {
+            log.error("🩹 [PONTE-CURA] Estornando capital fantasma de R$ {} (ID: {}).",
+                    custoRemovido.setScale(2, RoundingMode.HALF_UP), clientOrderId);
+
+            // 2. Força a atualização do Poder de Compra Ajustado no snapshot atômico
+            BigDecimal currentBP = accountValuesCache.getOrDefault(KEY_BUYING_POWER, BigDecimal.ZERO);
+            handleBuyingPowerUpdate(currentBP);
         }
     }
 
@@ -611,6 +677,8 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
                 accountValuesCache.getOrDefault("EQUITYWITHLOANVALUE", BigDecimal.ZERO));
     }
 
+
+
     // --- MÉTODOS DE ACESSO Específicos para Margem (USAM AS NOVAS CONSTANTES UPPERCASE) ---
 
     public BigDecimal getInitialMarginRequirement() {
@@ -725,21 +793,35 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
 
     // --- MÉTODOS PRIVADOS DE DOMÍNIO ---
 
+    /**
+     * 🛠️ MAPPER CORRIGIDO: Preserva o sinal negativo para posições SHORT.
+     * Impede que o sistema principal envie SELL para fechar uma dívida.
+     */
     private Position mapPositionDTOtoDomain(PositionDTO dto) {
-        BigDecimal quantity = dto.getPosition().abs();
-        PositionDirection direction = dto.getPosition().signum() > 0 ? PositionDirection.LONG : PositionDirection.SHORT;
+        // 🚨 REGRA MESTRE: Não use .abs() aqui. O sinal negativo é a identidade do Short.
+        BigDecimal quantityWithSignal = dto.getPosition();
+
+        // Determina a direção baseada no sinal real vindo da IBKR
+        PositionDirection direction = (quantityWithSignal.signum() < 0)
+                ? PositionDirection.SHORT
+                : PositionDirection.LONG;
+
+        log.warn("📦 [PONTE-SYNC] {} | Qtd Recebida: {} | Direção Definida: {}",
+                dto.getTicker(), quantityWithSignal, direction);
 
         return Position.builder()
                 .symbol(dto.getTicker())
-                .quantity(quantity)
+                .quantity(quantityWithSignal) // ✅ Agora o -4199.0 permanece -4199.0
                 .averageEntryPrice(dto.getMktPrice())
                 .entryTime(LocalDateTime.now())
                 .direction(direction)
                 .stopLoss(null)
                 .takeProfit(null)
-                .rationale("Sincronizado via TWS")
+                .rationale("Sincronizado via TWS (Sinal Preservado)")
                 .build();
     }
+
+
 
     private Portfolio performShortEntryExecution(Portfolio current, TradeExecutedEvent event) {
         String symbol = event.symbol();

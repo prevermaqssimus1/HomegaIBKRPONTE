@@ -59,6 +59,18 @@ public record OrderDTO(
     }
 
     /**
+     * Helper para criar uma NOVA instância com o preço atualizado.
+     */
+    public OrderDTO withPrice(BigDecimal newPrice) {
+        return new OrderDTO(
+                this.symbol, this.type, this.quantity, newPrice, this.orderId,
+                this.stopLossOrderId, this.takeProfitOrderId, this.stopLossPrice,
+                this.takeProfitPrice, this.priceRef, this.limitPrice, this.rationale,
+                this.clientOrderId, this.childOrders
+        );
+    }
+
+    /**
      * Helper para clonar o DTO com o Tipo e Preço Limite alterados.
      * Essencial para a lógica de conversão MKT -> LMT no Resgate.
      */

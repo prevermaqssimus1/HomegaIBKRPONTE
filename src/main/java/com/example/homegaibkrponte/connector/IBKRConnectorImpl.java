@@ -63,8 +63,7 @@ public class IBKRConnectorImpl implements IBKRConnector {
             }
 
             // Registra capital "em voo" na LivePortfolioService
-            livePortfolioService.trackOrderSent(clientOrderIdStr, BigDecimal.valueOf(quantity), referencePrice);
-
+            livePortfolioService.trackOrderSent(clientOrderIdStr, symbol, BigDecimal.valueOf(quantity), referencePrice);
             // 🛡️ PASSO 3: TRANSMISSÃO TWS
             // TODO: Aqui entra a chamada nativa da IBKR API (eClient.placeOrder)
             log.info("✅ [TWS-OUT] Ordem transmitida com sucesso. ID: {}", orderIdLong);

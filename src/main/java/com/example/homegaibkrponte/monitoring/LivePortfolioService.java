@@ -885,75 +885,150 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
     }
 
     private Portfolio performBuyExecution(Portfolio current, TradeExecutedEvent event) {
-        String symbol = event.symbol();
-        BigDecimal qty = event.quantity();
-        BigDecimal price = event.price();
+        try {
+            String symbol = event.symbol();
+            BigDecimal qty = event.quantity();
+            BigDecimal price = event.price();
 
-        BigDecimal cost = qty.multiply(price);
-        BigDecimal newCash = current.cashBalance().subtract(cost);
-        Map<String, Position> newPositions = new ConcurrentHashMap<>(current.openPositions());
+            // 🛡️ PROTEÇÃO: Evita processar eventos com quantidade inválida
+            if (qty == null || qty.signum() == 0) {
+                log.error("🚦 [PONTE-SHIELD] Quantidade zerada ou nula para {}. Ignorando atualização.", symbol);
+                return current;
+            }
 
-        Position existingPosition = newPositions.get(symbol);
-        if (existingPosition != null) {
-            BigDecimal totalQty = existingPosition.getQuantity().add(qty);
-            BigDecimal totalCost = existingPosition.getAverageEntryPrice().multiply(existingPosition.getQuantity()).add(cost);
-            BigDecimal newAvgPrice = totalCost.divide(totalQty, 4, RoundingMode.HALF_UP);
+            BigDecimal cost = qty.multiply(price);
+            BigDecimal newCash = current.cashBalance().subtract(cost);
+            Map<String, Position> newPositions = new ConcurrentHashMap<>(current.openPositions());
 
-            Position updatedPosition = new Position(symbol, totalQty, newAvgPrice, LocalDateTime.now(), existingPosition.getDirection(), existingPosition.getStopLoss(), existingPosition.getTakeProfit(), "Aumento de Posição");
-            newPositions.put(symbol, updatedPosition);
-        } else {
-            Position newPosition = new Position(symbol, qty, price, LocalDateTime.now(), PositionDirection.LONG, null, null, "Nova Posição");
-            newPositions.put(symbol, newPosition);
+            Position existingPosition = newPositions.get(symbol);
+            if (existingPosition != null) {
+                BigDecimal totalQty = existingPosition.getQuantity().add(qty);
+
+                // 🛡️ CURA: Se a quantidade total for zero (ex: cobriu um Short exatamente), removemos a posição
+                // Isso evita a 'ArithmeticException: BigInteger divide by zero'
+                if (totalQty.signum() == 0) {
+                    newPositions.remove(symbol);
+                    log.warn("✅ [PONTE | TWS-IN] {} zerado (Fechamento total). Novo saldo: R$ {}",
+                            symbol, newCash.setScale(2, RoundingMode.HALF_UP));
+                } else {
+                    // Cálculo de Preço Médio Protegido
+                    BigDecimal totalCost = existingPosition.getAverageEntryPrice()
+                            .multiply(existingPosition.getQuantity()).add(cost);
+
+                    // Divisão com 8 casas decimais para sinergia com o Principal
+                    BigDecimal newAvgPrice = totalCost.divide(totalQty, 8, RoundingMode.HALF_UP).abs();
+
+                    // Mantemos o construtor original da Ponte para não quebrar a estrutura de modelos
+                    Position updatedPosition = new Position(
+                            symbol,
+                            totalQty,
+                            newAvgPrice,
+                            LocalDateTime.now(),
+                            existingPosition.getDirection(),
+                            existingPosition.getStopLoss(),
+                            existingPosition.getTakeProfit(),
+                            "Ajuste de Posição via Execução"
+                    );
+                    newPositions.put(symbol, updatedPosition);
+
+                    log.warn("✅ [PONTE | TWS-IN] COMPRA para {} registrada. PM: R$ {} | Qtd: {}",
+                            symbol, newAvgPrice.setScale(2, RoundingMode.HALF_UP), totalQty);
+                }
+            } else {
+                // Nova Posição (Início de LONG)
+                Position newPosition = new Position(
+                        symbol,
+                        qty,
+                        price,
+                        LocalDateTime.now(),
+                        PositionDirection.LONG,
+                        null,
+                        null,
+                        "Nova Posição via TWS"
+                );
+                newPositions.put(symbol, newPosition);
+                log.warn("✅ [PONTE | TWS-IN] NOVA COMPRA para {} registrada. Preço: R$ {}", symbol, price);
+            }
+
+            // Reconstrói o Portfólio usando o Builder
+            return current.toBuilder()
+                    .cashBalance(newCash)
+                    .openPositions(newPositions)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("❌ [PONTE-CRITICAL] Falha ao processar performBuyExecution para {}: {}",
+                    event.symbol(), e.getMessage());
+            return current; // Fail-safe: retorna o estado atual para não corromper o sistema
         }
-
-        log.warn("✅ [PORTFÓLIO LIVE] COMPRA para {} registrada. Novo saldo: R$ {}", symbol, newCash.setScale(2, RoundingMode.HALF_UP));
-        return current.toBuilder().cashBalance(newCash).openPositions(newPositions).build();
     }
 
     private Portfolio performSellExecution(Portfolio current, TradeExecutedEvent event) {
-        String symbol = event.symbol();
-        String side = event.side();
-        BigDecimal qty = event.quantity();
-        BigDecimal price = event.price();
+        try {
+            String symbol = event.symbol();
+            BigDecimal qty = event.quantity().abs(); // Garantimos valor positivo para o cálculo
+            BigDecimal price = event.price();
 
-        Position positionToClose = current.openPositions().get(symbol);
-
-        if (positionToClose == null) {
-            // Pode ser uma venda a descoberto (SHORT entry)
-            if (side.equalsIgnoreCase("SELL") || side.equalsIgnoreCase("SLD")) {
-                return performShortEntryExecution(current, event);
+            // 🛡️ PROTEÇÃO: Evita processar eventos com quantidade inválida
+            if (qty == null || qty.signum() == 0) {
+                log.error("🚦 [PONTE-SHIELD-SELL] Quantidade inválida para {}. Ignorando atualização.", symbol);
+                return current;
             }
-            log.error("TENTATIVA DE VENDA INVÁLIDA: Posição {} não encontrada.", symbol);
-            return current;
-        }
 
-        // Se a posição for LONG, é uma venda para fechar ou parcial (SELL)
-        if (positionToClose.getDirection() == PositionDirection.LONG) {
             BigDecimal revenue = qty.multiply(price);
             BigDecimal newCash = current.cashBalance().add(revenue);
             Map<String, Position> newPositions = new ConcurrentHashMap<>(current.openPositions());
 
-            if (qty.compareTo(positionToClose.getQuantity()) >= 0) {
-                newPositions.remove(symbol);
-                log.warn("✅ [PORTFÓLIO LIVE] VENDA TOTAL (ENCERRAMENTO LONG) para {} registrada. Novo saldo: R$ {}", symbol, newCash.setScale(2, RoundingMode.HALF_UP));
+            Position existingPosition = newPositions.get(symbol);
+            if (existingPosition != null) {
+                // No caso de Venda de Long, subtraímos a quantidade
+                BigDecimal currentQty = existingPosition.getQuantity();
+                BigDecimal newQuantity = currentQty.subtract(qty);
+
+                // 🛡️ CURA: Se a quantidade resultar em zero (ou poeira < 0.000001), removemos a posição
+                if (newQuantity.abs().compareTo(new BigDecimal("0.000001")) <= 0) {
+                    newPositions.remove(symbol);
+                    log.warn("❌ [PONTE | TWS-IN] {} ENCERRADA via VENDA. Novo saldo: R$ {}",
+                            symbol, newCash.setScale(2, RoundingMode.HALF_UP));
+                } else {
+                    // Para vendas parciais de Long, o preço médio não muda, apenas a quantidade.
+                    // Mas, para manter a compatibilidade se for uma redução de Short (virando a mão):
+                    Position updatedPosition = existingPosition.toBuilder()
+                            .quantity(newQuantity)
+                            .rationale("Redução de Posição via Execução")
+                            .build();
+
+                    newPositions.put(symbol, updatedPosition);
+
+                    log.info("✅ [PONTE | TWS-IN] VENDA PARCIAL de {}. Qtd Restante: {}",
+                            symbol, newQuantity);
+                }
             } else {
-                BigDecimal remainingQty = positionToClose.getQuantity().subtract(qty);
-
-                Position updatedPosition = positionToClose.toBuilder()
-                        .quantity(remainingQty)
-                        .rationale("Venda Parcial - Qtd: " + remainingQty.toPlainString())
-                        .build();
-
-                newPositions.put(symbol, updatedPosition);
-                log.warn("✅ [PORTFÓLIO LIVE] VENDA PARCIAL para {} registrada. Qtd Restante: {}.", symbol, remainingQty.toPlainString());
+                // Se não existia posição e vendeu, iniciou um SHORT
+                Position newPosition = new Position(
+                        symbol,
+                        qty.negate(), // Quantidade negativa para Short
+                        price,
+                        LocalDateTime.now(),
+                        PositionDirection.SHORT,
+                        null,
+                        null,
+                        "Nova Posição SHORT via TWS"
+                );
+                newPositions.put(symbol, newPosition);
+                log.warn("✅ [PONTE | TWS-IN] NOVA VENDA (SHORT) para {} registrada. Preço: R$ {}", symbol, price);
             }
-            return current.toBuilder().cashBalance(newCash).openPositions(newPositions).build();
-        } else if (positionToClose.getDirection() == PositionDirection.SHORT) {
-            // Se a posição for SHORT, a única venda que faz sentido é a cobertura (BUY_TO_COVER)
-            return performShortCoverExecution(current, event);
-        }
 
-        return current;
+            return current.toBuilder()
+                    .cashBalance(newCash)
+                    .openPositions(newPositions)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("❌ [PONTE-SELL-CRITICAL] Falha ao processar venda para {}: {}",
+                    event.symbol(), e.getMessage());
+            return current;
+        }
     }
 
     public AccountStateDTO getFullAccountState(String accountId) {

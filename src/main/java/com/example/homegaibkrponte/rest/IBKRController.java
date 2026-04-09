@@ -72,6 +72,22 @@ public class IBKRController {
     }
 
 
+    @PostMapping("/reconnect")
+    public ResponseEntity<String> reconnect() {
+        log.warn("🔌 [PONTE] Recebido comando de RECONEXÃO FORÇADA do sistema Principal.");
+        try {
+            connector.disconnect();
+            // Pequeno delay para garantir que os sockets fecharam no SO
+            Thread.sleep(1000);
+            connector.connect();
+            return ResponseEntity.ok("Reconexão disparada com sucesso");
+        } catch (Exception e) {
+            log.error("❌ Erro ao processar reconexão: {}", e.getMessage());
+            return ResponseEntity.internalServerError().body("Falha ao reconectar: " + e.getMessage());
+        }
+    }
+
+
 
     /**
      * ✅ ENDPOINT CRÍTICO: Fornece a liquidez em tempo real para o Principal.
@@ -115,11 +131,30 @@ public class IBKRController {
     @GetMapping("/market-price/{symbol}")
     public ResponseEntity<BigDecimal> fetchLatestMarketPrice(@PathVariable String symbol) {
         try {
+            // 1. Tenta o cache primeiro (rápido)
             Optional<BigDecimal> priceOpt = connector.getLatestCachedPrice(symbol);
-            return priceOpt.map(ResponseEntity::ok).orElseGet(() -> ResponseEntity.notFound().build());
+
+            if (priceOpt.isPresent()) {
+                return ResponseEntity.ok(priceOpt.get());
+            }
+
+            // 2. AUTO-CURA: Se o cache falhar (causa do 404), FORÇA o Snapshot na IBKR
+            log.warn("📡 [PONTE-RECOVERY] Preço de {} ausente no cache. Solicitando SNAPSHOT real à TWS...", symbol);
+
+            // Chamamos o método de força bruta que ajustamos no IBKRConnector
+            BigDecimal forcedPrice = connector.requestImmediatePriceSnapshot(symbol);
+
+            if (forcedPrice != null && forcedPrice.signum() > 0) {
+                log.info("✅ [PONTE-RECOVERY] Preço de {} obtido via Snapshot e devolvido ao Principal: $ {}", symbol, forcedPrice);
+                return ResponseEntity.ok(forcedPrice);
+            }
+
+            log.error("❌ [PONTE-FALHA] Snapshot falhou para {}. TWS não respondeu.", symbol);
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(BigDecimal.ZERO);
+
         } catch (Exception e) {
-            log.error("❌ ERRO ao obter preço: {}", symbol, e);
-            return ResponseEntity.internalServerError().body(BigDecimal.ZERO);
+            log.error("❌ ERRO crítico ao buscar preço Snapshot para {}: {}", symbol, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
         }
     }
 

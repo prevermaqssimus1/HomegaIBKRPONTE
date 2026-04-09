@@ -81,40 +81,25 @@ public class OrderService {
     private OrderDTO handleSimpleOrder(OrderDTO orderDto, boolean isReduction) {
         int tempId = orderIdManager.getNextOrderId();
         Contract contract = contractFactory.create(orderDto.symbol());
-
-        // 🎯 [AUDITORIA-P1] CAPTURA DE PREÇO REAL PARA EXECUÇÃO
         BigDecimal executionPrice = portfolioService.getPriceForOrder(orderDto.symbol());
 
-        // 🛡️ SINERGIA: Blindagem contra Drift de Preço (Usando o novo método withPrice)
+        // 🛡️ SINERGIA: Garante que ordens com a tag de urgência sejam tratadas como redução de risco
+        boolean isUrgente = isReduction ||
+                (orderDto.rationale() != null && orderDto.rationale().contains("[URGENT-CLOSE]"));
+
         OrderDTO finalDto = orderDto;
         if (orderDto.price() == null || orderDto.price().signum() <= 0) {
-            log.warn("⚠️ [RECOVERY-PRICE] {} chegou sem preço. Injetando Snapshot: ${}", orderDto.symbol(), executionPrice);
             finalDto = orderDto.withPrice(executionPrice);
         }
 
-        // Criação do objeto de ordem da IBKR
         Order ibkrOrder = orderFactory.create(finalDto, String.valueOf(tempId));
 
-        // ✅ REGRA DE OURO: Se for REDUÇÃO/SHORT-COVER, pula a simulação
-        if (isReduction) {
-            log.warn("🛡️ [PONTE | PRIORIDADE] Ordem de mitigação para {} detectada. Ignorando What-If.", finalDto.symbol());
-            int finalOrderId = orderIdManager.getNextOrderId();
-            ibkrOrder.orderId(finalOrderId);
-            orderIdManager.linkIds(finalDto.clientOrderId(), finalOrderId);
-
-            // 📊 Auditoria de Custo Final
-            BigDecimal custoReal = finalDto.quantity().multiply(executionPrice).abs();
-            log.info("📦 [TWS-OUT-PRIORITY] {} | Qtd: {} | Preço: ${} | Custo Est: ${}",
-                    finalDto.symbol(), finalDto.quantity(), executionPrice, custoReal);
-
-            // Registra o capital antes de enviar
-            portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(), finalDto.quantity(), executionPrice);
-
-            connector.placeOrder(finalOrderId, contract, ibkrOrder);
-            return finalDto.withOrderId(finalOrderId);
+        // ✅ PRIORIDADE ABSOLUTA: Se for fechamento, ignoramos restrições de preço da corretora
+        if (isUrgente) {
+            ibkrOrder.overridePercentageConstraints(true);
+            log.warn("🛡️ [RECOVERY-MODE] Ativando Liquidação de Emergência para {}. Ignorando travas de preço.", finalDto.symbol());
         }
 
-        // 🚀 FLUXO PARA NOVAS ENTRADAS
         try {
             log.info("🔍 [PRE-CHECK] Simulando margem para {} (ID: {})", finalDto.symbol(), tempId);
             boolean temMargem = connector.validarMargemPreventiva(contract, ibkrOrder);
@@ -125,25 +110,29 @@ public class OrderService {
 
             if (!temMargem) {
                 double qtdOriginal = ibkrOrder.totalQuantity().value().doubleValue();
-                double novaQtd = Math.floor(qtdOriginal * 0.60);
+
+                // 🔥 EFEITO CUNHA: Se for urgente (fechar short), tentamos apenas 10%.
+                // Se for abertura comum, tentamos 60%.
+                double fatorReducao = isUrgente ? 0.10 : 0.60;
+                double novaQtd = Math.max(1.0, Math.floor(qtdOriginal * fatorReducao));
+
                 String elProjetado = connector.getLastWhatIfExcessLiquidity();
 
-                log.warn("📉 [ADAPTIVE-SIZE] Margem insuficiente para {}. Reduzindo: {} -> {} | EL: {}",
-                        finalDto.symbol(), qtdOriginal, novaQtd, elProjetado);
+                log.warn("📉 [MARGIN-FATAL] Margem insuficiente para {}. Aplicando FRACIONAMENTO: {} -> {} | Motivo: {}",
+                        finalDto.symbol(), qtdOriginal, novaQtd, isUrgente ? "LIQUIDAÇÃO_URGENTE" : "ADAPTIVE_ENTRY");
 
-                ibkrOrder.totalQuantity(com.ib.client.Decimal.get(novaQtd));
-                webhookNotifier.sendAdaptiveCheckAlert(finalDto.symbol(), qtdOriginal, novaQtd, elProjetado);
+                ibkrOrder.totalQuantity(Decimal.get(novaQtd));
+                webhookNotifier.sendAdaptiveCheckAlert(finalDto.symbol(), qtdOriginal, novaQtd, "Recuperação de Margem 201");
             }
 
-            // 📊 Auditoria de Custo Real
             BigDecimal custoReal = BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue())
                     .multiply(executionPrice).abs();
 
             log.info("📦 [TWS-OUT] Despachando {} | Qtd Final: {} | Preço: ${} | Custo: ${}",
                     finalDto.symbol(), ibkrOrder.totalQuantity().value(), executionPrice, custoReal);
 
-            // Registra o capital antes de enviar
-            portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(), finalDto.quantity(), executionPrice);
+            portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(),
+                    BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue()), executionPrice);
 
             connector.placeOrder(finalOrderId, contract, ibkrOrder);
             return finalDto.withOrderId(finalOrderId);

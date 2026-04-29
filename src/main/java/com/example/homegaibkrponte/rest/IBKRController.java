@@ -3,6 +3,7 @@ package com.example.homegaibkrponte.rest;
 import com.example.homegaibkrponte.connector.IBKRConnector;
 import com.example.homegaibkrponte.connector.mapper.IBKRMapper;
 import com.example.homegaibkrponte.dto.*;
+import com.example.homegaibkrponte.model.BridgeHealthStatus;
 import com.example.homegaibkrponte.model.Candle;
 import com.example.homegaibkrponte.model.OrderStateDTO;
 import com.example.homegaibkrponte.model.PositionDTO;
@@ -72,6 +73,24 @@ public class IBKRController {
     }
 
 
+    /**
+     * 🛰️ ENDPOINT DE SAÚDE TÁTICA (Passo 4)
+     * O Principal consulta este endpoint antes de iniciar o ciclo da IA.
+     * Retorna STRESSED se a margem estiver crítica ou o sistema lento.
+     */
+    @GetMapping("/health-check")
+    public ResponseEntity<BridgeHealthStatus> healthCheck() {
+        try {
+            // O livePortfolioService da PONTE calcula o status baseado na margem atual
+            BridgeHealthStatus status = portfolioService.getBridgeHealth();
+            return ResponseEntity.ok(status);
+        } catch (Exception e) {
+            // Em caso de erro na Ponte, retornamos STRESSED por segurança
+            return ResponseEntity.ok(BridgeHealthStatus.STRESSED);
+        }
+    }
+
+
     @PostMapping("/reconnect")
     public ResponseEntity<String> reconnect() {
         log.warn("🔌 [PONTE] Recebido comando de RECONEXÃO FORÇADA do sistema Principal.");
@@ -130,32 +149,14 @@ public class IBKRController {
 
     @GetMapping("/market-price/{symbol}")
     public ResponseEntity<BigDecimal> fetchLatestMarketPrice(@PathVariable String symbol) {
-        try {
-            // 1. Tenta o cache primeiro (rápido)
-            Optional<BigDecimal> priceOpt = connector.getLatestCachedPrice(symbol);
-
-            if (priceOpt.isPresent()) {
-                return ResponseEntity.ok(priceOpt.get());
-            }
-
-            // 2. AUTO-CURA: Se o cache falhar (causa do 404), FORÇA o Snapshot na IBKR
-            log.warn("📡 [PONTE-RECOVERY] Preço de {} ausente no cache. Solicitando SNAPSHOT real à TWS...", symbol);
-
-            // Chamamos o método de força bruta que ajustamos no IBKRConnector
-            BigDecimal forcedPrice = connector.requestImmediatePriceSnapshot(symbol);
-
-            if (forcedPrice != null && forcedPrice.signum() > 0) {
-                log.info("✅ [PONTE-RECOVERY] Preço de {} obtido via Snapshot e devolvido ao Principal: $ {}", symbol, forcedPrice);
-                return ResponseEntity.ok(forcedPrice);
-            }
-
-            log.error("❌ [PONTE-FALHA] Snapshot falhou para {}. TWS não respondeu.", symbol);
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(BigDecimal.ZERO);
-
-        } catch (Exception e) {
-            log.error("❌ ERRO crítico ao buscar preço Snapshot para {}: {}", symbol, e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(BigDecimal.ZERO);
-        }
+        // 1. Tenta apenas o cache de streaming da TWS
+        return connector.getLatestCachedPrice(symbol)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> {
+                    // A Ponte deixa de se intrometer e admite que não tem o dado em tempo real
+                    log.debug("🔍 [PONTE-CACHE] Preço de {} indisponível no stream.", symbol);
+                    return ResponseEntity.status(HttpStatus.NOT_FOUND).body(BigDecimal.ZERO);
+                });
     }
 
     @PostMapping("/sync")
@@ -174,17 +175,16 @@ public class IBKRController {
 
     @GetMapping("/positions")
     public ResponseEntity<List<PositionDTO>> getOpenPositions() {
-        if (!connector.isConnected()) return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        // 🛡️ Validação de Sanidade mantida
+        if (!connector.isConnected()) {
+            log.error("❌ [PONTE] Falha ao listar posições: Socket TWS desconectado.");
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        }
+
         try {
-            portfolioService.resetPositionSyncLatch();
-
-            // 🎯 Redirecionado para o segundo Client ID
-            connector.getAccountClient().reqPositions();
-
-            boolean syncCompleted = portfolioService.awaitPositionSync(60000);
-
-            if (!syncCompleted) return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT).build();
-
+            // 🚀 [AJUSTE SNIPER] LATÊNCIA ZERO
+            // Em vez de bloquear a thread por 60s com awaitPositionSync,
+            // lemos o Snapshot atômico que a Ponte já mantém na RAM.
             List<PositionDTO> positions = portfolioService.getLivePortfolioSnapshot()
                     .openPositions().values().stream()
                     .map(p -> {
@@ -195,16 +195,28 @@ public class IBKRController {
                         return d;
                     }).collect(Collectors.toList());
 
+            // 🔄 [BACKGROUND REFRESH]
+            // Dispara o pedido de atualização para a TWS em segundo plano.
+            // Assim, o cache da Ponte se mantém renovado para a próxima chamada sem travar o Principal agora.
+            try {
+                portfolioService.resetPositionSyncLatch();
+                connector.getAccountClient().reqPositions();
+            } catch (Exception e) {
+                log.warn("⚠️ [PONTE] Falha ao disparar refresh de posições em background.");
+            }
+
+            log.info("📡 [PONTE | API] Retornando {} posições via Cache (Latência Zero).", positions.size());
             return ResponseEntity.ok(positions);
+
         } catch (Exception e) {
+            log.error("💥 [PONTE] Erro ao recuperar posições do cache: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
-
     @PostMapping("/place-order")
     public ResponseEntity<?> placeOrder(@RequestBody OrderDTO orderDto) {
         // 1. Log de entrada para rastreio de auditoria
-        log.info("🛒 [PONTE] Recebida submissão: {} | Ativo: {} | Tipo: {} | Qtd: {}",
+        log.info("🛒🛒🛒🛒🛒🛒🛒 [PONTE] Recebida submissão: {} | Ativo: {} | Tipo: {} | Qtd: {}",
                 orderDto.clientOrderId(), orderDto.symbol(), orderDto.type(), orderDto.quantity());
 
         try {

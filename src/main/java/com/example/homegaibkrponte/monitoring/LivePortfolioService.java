@@ -33,6 +33,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -57,6 +58,7 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
     private final AtomicReference<BigDecimal> cash = new AtomicReference<>(BigDecimal.ZERO);
     private final AtomicReference<BigDecimal> bp = new AtomicReference<>(BigDecimal.ZERO);
     private final AtomicReference<BigDecimal> el = new AtomicReference<>(BigDecimal.ZERO);
+    private final ReentrantLock liquidityLock = new ReentrantLock();
 
 
 
@@ -129,6 +131,77 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
+    /**
+     * 💓 PASSO 4: ATUALIZADOR DE SAÚDE DA PONTE (Kill Switch)
+     * Chamado pelo IBKRConnector ao detectar colapso de rede ou margem.
+     */
+    public void updateBridgeHealth(BridgeHealthStatus status) {
+        if (status == BridgeHealthStatus.STRESSED) {
+            log.error("🚨 [SISTEMA-STRESSED] Ponte sinalizou falha crítica ou margem esgotada.");
+            // Opcional: Publica evento interno caso queira que outros serviços da ponte reajam
+            // eventPublisher.publishEvent(new BridgeHealthEvent(status));
+        } else {
+            log.info("🟢 [SISTEMA-OPERATIONAL] Ponte normalizada.");
+        }
+
+        // Sincronia de Estado: O status será refletido no próximo heartbeat que o Principal solicitar
+        // através do método getBridgeHealth() que você já possui.
+    }
+
+
+//    /**
+//     * 🛡️ MÉTODO ÚLTIMA ESPERANÇA (Sinergia de Dados)
+//     * Se o streaming falhar e o snapshot for rejeitado (Erro 10197),
+//     * este método busca o último preço conhecido no inventário de posições.
+//     * Evita que o Winston aborte o ciclo operacional por falta de preço.
+//     */
+//    public BigDecimal getLastKnownPriceFromPosition(String symbol) {
+//        if (symbol == null) return BigDecimal.ZERO;
+//        String sym = symbol.toUpperCase();
+//
+//        // 1. ⚡ PRIORIDADE REAL: Tenta buscar o preço de mercado cacheado pelo streaming
+//        // A chave "_PRICE" é alimentada pelo fluxo contínuo de ticks.
+//        BigDecimal marketPrice = accountValuesCache.get(sym + "_PRICE");
+//        if (marketPrice != null && marketPrice.signum() > 0) {
+//            return marketPrice;
+//        }
+//
+//        // 2. 🔍 SEGUNDA CAMADA: Busca no inventário de posições sincronizadas
+//        return getPosition(sym)
+//                .map(pos -> {
+//                    // 🎯 Lógica direta: Prioriza o MarketPrice da última sincronia, senão o PM
+//                    BigDecimal price = (pos.getCurrentMarketPrice() != null && pos.getCurrentMarketPrice().signum() > 0)
+//                            ? pos.getCurrentMarketPrice()
+//                            : pos.getAverageEntryPrice();
+//
+//                    if (price.signum() > 0) {
+//                        log.warn("⚠️ [PONTE-FALLBACK] Preço Fresh indisponível para {}. Usando suporte do inventário: ${}",
+//                                sym, price);
+//                        return price;
+//                    }
+//                    return BigDecimal.ZERO;
+//                })
+//                .orElseGet(() -> {
+//                    // 3. 🚨 ÚLTIMA LINHA DE DEFESA (GHOST RECOVERY):
+//                    // Se não há posição, varre o cache por qualquer rastro de preço (Snapshots anteriores)
+//                    BigDecimal lastAnyPrice = accountValuesCache.entrySet().stream()
+//                            .filter(e -> e.getKey().startsWith(sym))
+//                            .map(Map.Entry::getValue)
+//                            .filter(v -> v.signum() > 0)
+//                            .findFirst()
+//                            .orElse(BigDecimal.ZERO);
+//
+//                    if (lastAnyPrice.signum() <= 0) {
+//                        log.error("❌ [DADO-FATAL] {} sem preço em NENHUMA base. Operação cega impedida.", sym);
+//                    } else {
+//                        log.info("🩹 [GHOST-PRICE] Preço de {} recuperado do rastro histórico: ${}", sym, lastAnyPrice);
+//                    }
+//                    return lastAnyPrice;
+//                });
+//    }
+
+
+
     public void trackOrderSent(String clientOrderId, String symbol, BigDecimal quantity, BigDecimal price) {
         try {
             // Se o preço chegar zerado, tenta um último resgate pelo símbolo
@@ -150,38 +223,29 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
             log.error("❌ Erro ao rastrear ordem {} no Portfólio: {}", clientOrderId, e.getMessage());
         }
     }
+
+
+
     /**
-     * 🚀 RESGATE DE PREÇO REAL (V30.1 - PROTOCOLO SNAPSHOT)
-     * Se o cache de ticks interno estiver zerado, força um snapshot síncrono na TWS.
-     * Isso elimina o erro [MARKET DATA ERROR] e o Custo R$ 0.00.
+     * 🎯 [LEITURA SOBERANA] Obtém preço apenas do cache de streaming.
+     * Sem chamadas síncronas de rede (Snapshot) para evitar travamento de threads.
      */
     public BigDecimal getPriceForOrder(String symbol) {
         if (symbol == null) return BigDecimal.ZERO;
 
         String priceKey = symbol.toUpperCase() + "_PRICE";
 
-        // 1. Tenta buscar do cache de mapa (SSOT) alimentado pelo streaming
+        // 1. Tenta buscar do cache de mapa (SSOT) alimentado pelo streaming da TWS
         BigDecimal price = accountValuesCache.get(priceKey);
 
-        // 2. 💎 VÁLVULA DE RESGATE: Se não há tick, solicita SNAPSHOT síncrono na TWS
+        // 2. Se não encontrar, retorne ZERO imediatamente.
+        // NÃO tente buscar na TWS aqui dentro. Isso é responsabilidade do heartbeat/streaming.
         if (price == null || price.signum() <= 0) {
-            log.warn("📡 [PRICE-RECOVERY] {} sem tick no cache. Solicitando SNAPSHOT físico à corretora...", symbol);
-
-            try {
-                // Chama o método síncrono no conector (implementação sugerida abaixo)
-                price = ibkrConnector.fetchMarketDataSnapshot(symbol);
-
-                if (price != null && price.signum() > 0) {
-                    // Alimenta o cache para evitar novas chamadas imediatas
-                    accountValuesCache.put(priceKey, price);
-                    log.info("✅ [PRICE-SNAPSHOT] {} recuperado com sucesso: ${}", symbol, price);
-                }
-            } catch (Exception e) {
-                log.error("❌ [SNAPSHOT-FAILED] Erro ao buscar preço para {}: {}", symbol, e.getMessage());
-            }
+            log.warn("⚠️ [DADO-AUSENTE] Preço para {} não disponível no cache de streaming.", symbol);
+            return BigDecimal.ZERO;
         }
 
-        return (price != null && price.signum() > 0) ? price : BigDecimal.ZERO;
+        return price;
     }
 
     /**
@@ -412,8 +476,8 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         try {
             String normalizedKey = key.toUpperCase();
             accountValuesCache.put(normalizedKey, value);
-            log.debug("📊 [CACHE PONTE] Valor Sincronizado: {} = R$ {}", normalizedKey, value.toPlainString());
-
+//            log.debug("📊 [CACHE PONTE] Valor Sincronizado: {} = R$ {}", normalizedKey, value.toPlainString());
+//
             switch (normalizedKey) {
                 case "NETLIQUIDATION", "NETLIQUIDATIONVALUE", "EQUITYWITHLOANVALUE" -> nlv.set(value);
                 case "CASHBALANCE" -> cash.set(value);
@@ -1054,6 +1118,31 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
                 dto.netLiquidation().toPlainString(), dto.buyingPower().toPlainString(), dto.currency());
 
         return dto;
+    }
+
+    public enum SystemHealth {
+        OPERATIONAL, // Verde: Tudo ok
+        STRESSED     // Amarelo/Vermelho: Margem alta ou I/O saturado. Só permite reduções.
+    }
+
+    /**
+     * 💓 HEARTBEAT LOGIC (Passo 4)
+     * Determina se a ponte está apta a receber novas ordens.
+     */
+    public BridgeHealthStatus getBridgeHealth() {
+        // 1. Checagem de Margem: Se a utilização for > 95%, sinaliza stress
+        BigDecimal utilization = getMarginUtilization();
+        if (utilization.compareTo(new BigDecimal("0.95")) >= 0) {
+            log.warn("⚠️ [HEALTH-STRESSED] Utilização de margem crítica: {}%", utilization.multiply(new BigDecimal("100")));
+            return BridgeHealthStatus.STRESSED;
+        }
+
+        // 2. Checagem de Conexão: Se o socket principal estiver instável
+        if (!ibkrConnector.isConnected()) {
+            return BridgeHealthStatus.STRESSED;
+        }
+
+        return BridgeHealthStatus.OPERATIONAL;
     }
 
     // Método que fornece o Account ID (necessário para a validação)

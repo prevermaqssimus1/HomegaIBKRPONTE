@@ -87,16 +87,24 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private Optional<BPSyncedListener> bpListener = Optional.empty();
     private Set<String> symbolsBoughtToday = Collections.synchronizedSet(new HashSet<>());
     private final ConcurrentHashMap<Integer, CompletableFuture<BigDecimal>> priceSnapshots = new ConcurrentHashMap<>();
-
+    private final AtomicInteger nextValidOrderId = new AtomicInteger(-1);
     private final ConcurrentHashMap<Integer, CompletableFuture<MarginWhatIfResponseDTO>> pendingMarginWhatIfRequests = new ConcurrentHashMap<>();
     private final Map<String, Integer> symbolFailureCounter = new ConcurrentHashMap<>();
+    // 🎯 O CORAÇÃO DO RELÓGIO: Cache de latência zero
+    private final ConcurrentHashMap<String, BigDecimal> beaconPriceCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> beaconTimestampCache = new ConcurrentHashMap<>();
     @Value("${api.ibkr.account-id:DUN652604}") // DUN... fica como fallback
     private String accountId;
 
     private EClientSocket accountClient;
     private EReaderSignal accountReaderSignal;
-    private static final int MARKET_DATA_CLIENT_ID = 115;
-    private static final int ACCOUNT_SYNC_CLIENT_ID = 116;
+
+
+    // 🛡️ CONTROLE DE CADÊNCIA (Market Data)
+//    private final Semaphore snapshotSemaphore = new Semaphore(1); // Um por vez para evitar 10197
+    private final Map<String, Long> lastSnapshotTime = new ConcurrentHashMap<>();
+    private static final long MIN_SNAPSHOT_INTERVAL_MS = 2000; // 2 segundos entre snapshots do mesmo ativo
+    private static final long GLOBAL_COOLDOWN_MS = 150; // 150ms entre ativos diferentes (Cadência Institucional)
 
     // ==========================================================
     // CONSTRUTOR
@@ -177,116 +185,160 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     }
 
 
-    /**
-     * 🚀 MÉTODO CENTRAL DE ENVIO (Garante o Passo 1)
-     * TODA submissão de ordem deve passar por aqui para alimentar o cache de recuperação.
-     */
+    // 🎯 EXECUTOR SERIAL (Deve ser declarado no topo da classe IBKRConnector)
+    // Este é o "regulador" do relógio. Ele garante ordem de chegada e evita sobrecarga no socket.
+    private final ExecutorService dispatcherExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ibkr-order-dispatcher");
+        t.setPriority(Thread.MAX_PRIORITY);
+        return t;
+    });
+
     /**
      * 🚀 ENVIO FÍSICO PARA TWS: Ponto final de execução na Ponte.
-     * Ajustado para garantir Sinergia de Capital (Flight Orders) e Cache de Recuperação.
+     * AJUSTADO PARA CONTROLE DE LATÊNCIA (PASSO 2)
      */
-    public void placeOrder(int orderId, Contract contract, com.ib.client.Order order) {
-        try {
-            if (isConnected()) {
-                // 1. 🚨 REGISTRO NO CACHE DE RECUPERAÇÃO
-                lastOrdersCache.put(orderId, order);
-                lastContractsCache.put(orderId, contract);
+//    public void placeOrder(String principalClientId, Contract contract, com.ib.client.Order order) {
+//        long entryTime = System.currentTimeMillis(); // ⏱️ Início da auditoria de latência
+//
+//        // 🛡️ ENTRADA NO FUNIL SERIALIZADO (Impede colisão de threads virtuais)
+//        dispatcherExecutor.submit(() -> {
+//            // 🛡️ GERA ID NUMÉRICO SEQUENCIAL INTERNO (Exigência da TWS)
+//            int internalIbkrId = this.getNextOrderId();
+//
+//            if (internalIbkrId < 0) {
+//                log.error("❌ [TWS-OUT] Abortando ordem {}. ID numérico ainda não sincronizado.", principalClientId);
+//                webhookNotifier.sendOrderRejection(principalClientId, -1L, -1, "ID não sincronizado");
+//                return;
+//            }
+//
+//            try {
+//                if (isConnected()) {
+//                    // 🔗 VINCULA O ID DE TEXTO AO CAMPO DE REFERÊNCIA DA IBKR
+//                    order.orderRef(principalClientId);
+//
+//                    // 1. 🚨 REGISTRO NO CACHE DE RECUPERAÇÃO
+//                    lastOrdersCache.put(internalIbkrId, order);
+//                    lastContractsCache.put(internalIbkrId, contract);
+//
+//                    // 2. 🛡️ SINERGIA DE CAPITAL ATÔMICA
+//                    BigDecimal quantity = new BigDecimal(order.totalQuantity().value().toString());
+//
+//                    // ⚡ AJUSTE DE LATÊNCIA: Prioriza o Preço Beacon (Passo 1) para evitar Snapshots lentos
+//                    BigDecimal price = order.lmtPrice() != 0 ? BigDecimal.valueOf(order.lmtPrice()) :
+//                            getStreamingPrice(contract.symbol()); // Usa o cache de milissegundos
+//
+//                    // Fallback de segurança caso o Beacon ainda não tenha o preço
+//                    if (price == null || price.signum() <= 0) {
+//                        price = portfolioService.getPriceForOrder(contract.symbol());
+//                    }
+//
+//                    // ✅ SINCRONIA: Reserva o capital no cofre interno
+//                    portfolioService.trackOrderSent(principalClientId, contract.symbol(), quantity, price);
+//
+//                    // 📊 AUDITORIA DE FILA
+//                    long waitTime = System.currentTimeMillis() - entryTime;
+//                    log.info("📦 [TWS-OUT] Ordem {} (Ref: {}) processada após {}ms em fila. Ativo: {} | Qtd: {} | Preço: ${}",
+//                            internalIbkrId, principalClientId, waitTime, contract.symbol(), quantity, price);
+//
+//                    // 3. ENVIO FÍSICO VIA SOCKET (Garante exclusividade da via)
+//                    this.client.placeOrder(internalIbkrId, contract, order);
+//
+//                    log.info("✅✅✅✅✅✅✅ [TWS-OUT] Ordem {} transmitida à IBKR com sucesso.✅✅", internalIbkrId);
+//
+//                    // ⏱️ CADÊNCIA TÉCNICA: Pequeno respiro (pacing) para não saturar o buffer da TWS
+//                    TimeUnit.MILLISECONDS.sleep(20);
+//
+//                } else {
+//                    log.error("❌ [TWS-OUT] Conexão inativa para ordem {}.", principalClientId);
+//                    webhookNotifier.sendOrderRejection(principalClientId, (long) internalIbkrId, -1, "Conexão Inativa");
+//                }
+//            } catch (Exception e) {
+//                log.error("💥 [TWS-OUT] Erro crítico no funil: {}", e.getMessage());
+//                lastOrdersCache.remove(internalIbkrId);
+//                lastContractsCache.remove(internalIbkrId);
+//                portfolioService.removePendingOrderById(principalClientId);
+//            }
+//        });
+//    }
 
-                // 2. 🛡️ SINERGIA DE CAPITAL: Reserva o capital no LivePortfolioService
-                BigDecimal quantity = new BigDecimal(order.totalQuantity().value().toString());
+    public void placeOrder(String principalClientId, Contract contract, com.ib.client.Order order) {
+        dispatcherExecutor.submit(() -> {
+            try {
+                if (!isConnected()) throw new IllegalStateException("TWS desconectada");
 
-                // Tenta obter o preço: Limite da ordem > Preço Snapshot > Fallback do Provider
-                BigDecimal price = order.lmtPrice() != 0 ? BigDecimal.valueOf(order.lmtPrice()) :
-                        portfolioService.getPriceForOrder(contract.symbol());
+                int internalIbkrId = this.getNextOrderId();
+                order.orderRef(principalClientId);
 
-                // ✅ CORREÇÃO: Passando os 4 parâmetros exigidos pela assinatura atualizada
-                // ID (String), Símbolo (String), Quantidade (BigDecimal), Preço (BigDecimal)
-                portfolioService.trackOrderSent(String.valueOf(orderId), contract.symbol(), quantity, price);
-
-                log.info("📦 [TWS-OUT] Ordem {} registrada e capital reservado. Ativo: {} | Qtd: {} | Preço Ref: ${}",
-                        orderId, contract.symbol(), quantity, price);
-
-                // 3. ENVIO FÍSICO VIA SOCKET
-                this.client.placeOrder(orderId, contract, order);
-
-                log.info("✅✅✅✅✅✅✅ [TWS-OUT] Ordem {} transmitida à IBKR com sucesso.✅✅", orderId);
-            } else {
-                log.error("❌ [TWS-OUT] Conexão inativa para ordem {}.", orderId);
-                webhookNotifier.sendOrderRejection(String.valueOf(orderId), (long) orderId, -1, "Conexão Inativa");
+                // Disparo sem espera de margem ou snapshot. A responsabilidade é do Principal.
+                this.client.placeOrder(internalIbkrId, contract, order);
+                log.info("✅✅✅✅✅✅✅✅✅✅✅✅✅ [TWS-OUT] Ordem {} transmitida.", internalIbkrId);
+            } catch (Exception e) {
+                log.error("💥 [TWS-OUT] Falha: {}", e.getMessage());
             }
-        } catch (Exception e) {
-            log.error("💥 [TWS-OUT] Erro crítico no placeOrder: {}", e.getMessage(), e);
-            lastOrdersCache.remove(orderId);
-            lastContractsCache.remove(orderId);
-            portfolioService.removePendingOrderById(String.valueOf(orderId));
-        }
+        });
     }
 
-    /**
-     * 📡 [AUTO-RECOVERY] Força um Snapshot imediato de preço na IBKR.
-     * Este método é chamado pelo Controller quando o preço não está no cache.
-     * Implementa SINERGIA para destravar o Winston em ativos sem streaming ativo.
-     */
-    public BigDecimal requestImmediatePriceSnapshot(String symbol) {
-        // 1. Verificação de Sanidade da Conexão
-        if (!isConnected()) {
-            log.error("❌ [RECOVERY-FALHA] Snapshot impossível para {}: Conexão com TWS inativa.", symbol);
-            return BigDecimal.ZERO;
-        }
+//    public BigDecimal requestImmediatePriceSnapshot(String symbol) {
+//        // 1. Verificação de Sanidade da Conexão
+//        if (!isConnected()) {
+//            log.error("❌ [RECOVERY-FALHA] Snapshot impossível para {}: Conexão com TWS inativa.", symbol);
+//            return BigDecimal.ZERO;
+//        }
+//
+//        // 2. Preparação do Rastreamento
+//        int reqId = getNextReqId();
+//        CompletableFuture<BigDecimal> future = new CompletableFuture<>();
+//
+//        // Registra nos mapas para que o callback 'tickPrice' saiba onde entregar o valor
+//        priceSnapshots.put(reqId, future);
+//        marketDataRequests.put(reqId, symbol);
+//
+//        try {
+//            // 3. Construção do Contrato usando seu Mapper (Sinergia)
+//            Contract contract = new Contract();
+//            contract.symbol(symbol.toUpperCase());
+//            contract.secType("STK");
+//            contract.exchange("SMART");
+//            contract.currency("USD");
+//
+//            // Caso tenha o mapper pronto, pode usar:
+//            // Contract contract = ibkrMapper.toContract(new Order(symbol, ...));
+//            // Mas para snapshot de preço, o bloco acima é mais direto e seguro.
+//
+//            // 4. Configuração do Tipo de Dado (Tipo 3 = Delayed se não houver assinatura Live)
+//            client.reqMarketDataType(3);
+//
+//            log.warn("📡 [SNAPSHOT-REQ] Acionando Snapshot forçado para {} (ReqId: {})", symbol, reqId);
+//
+//            // 5. Solicitação do Snapshot (quarto parâmetro 'true' indica Snapshot)
+//            client.reqMktData(reqId, contract, "", true, false, null);
+//
+//            // 6. Aguarda o snapshotFuture.complete() que já existe no seu 'tickPrice'
+//            // Timeout de 5 segundos para não travar a Virtual Thread do Winston por muito tempo
+//            BigDecimal price = future.get(5, TimeUnit.SECONDS);
+//
+//            if (price != null && price.signum() > 0) {
+//                log.info("✅ [RECOVERY-SUCCESS] Preço para {} recuperado: $ {}", symbol, price);
+//                // Alimenta o cache local para evitar novas chamadas imediatas
+//                marketPriceCache.put(symbol.toUpperCase(), price);
+//                return price;
+//            }
+//
+//            return BigDecimal.ZERO;
+//
+//        } catch (TimeoutException e) {
+//            log.error("⏳ [RECOVERY-TIMEOUT] IBKR não respondeu snapshot de {} em 5s.", symbol);
+//            return BigDecimal.ZERO;
+//        } catch (Exception e) {
+//            log.error("❌ [RECOVERY-ERROR] Erro técnico no snapshot de {}: {}", symbol, e.getMessage());
+//            return BigDecimal.ZERO;
+//        } finally {
+//            // 7. Limpeza obrigatória para evitar Memory Leak
+//            priceSnapshots.remove(reqId);
+//            // Mantemos no marketDataRequests apenas se quisermos que o streaming continue
+//        }
+//    }
 
-        // 2. Preparação do Rastreamento
-        int reqId = getNextReqId();
-        CompletableFuture<BigDecimal> future = new CompletableFuture<>();
-
-        // Registra nos mapas para que o callback 'tickPrice' saiba onde entregar o valor
-        priceSnapshots.put(reqId, future);
-        marketDataRequests.put(reqId, symbol);
-
-        try {
-            // 3. Construção do Contrato usando seu Mapper (Sinergia)
-            Contract contract = new Contract();
-            contract.symbol(symbol.toUpperCase());
-            contract.secType("STK");
-            contract.exchange("SMART");
-            contract.currency("USD");
-
-            // Caso tenha o mapper pronto, pode usar:
-            // Contract contract = ibkrMapper.toContract(new Order(symbol, ...));
-            // Mas para snapshot de preço, o bloco acima é mais direto e seguro.
-
-            // 4. Configuração do Tipo de Dado (Tipo 3 = Delayed se não houver assinatura Live)
-            client.reqMarketDataType(3);
-
-            log.warn("📡 [SNAPSHOT-REQ] Acionando Snapshot forçado para {} (ReqId: {})", symbol, reqId);
-
-            // 5. Solicitação do Snapshot (quarto parâmetro 'true' indica Snapshot)
-            client.reqMktData(reqId, contract, "", true, false, null);
-
-            // 6. Aguarda o snapshotFuture.complete() que já existe no seu 'tickPrice'
-            // Timeout de 5 segundos para não travar a Virtual Thread do Winston por muito tempo
-            BigDecimal price = future.get(5, TimeUnit.SECONDS);
-
-            if (price != null && price.signum() > 0) {
-                log.info("✅ [RECOVERY-SUCCESS] Preço para {} recuperado: $ {}", symbol, price);
-                // Alimenta o cache local para evitar novas chamadas imediatas
-                marketPriceCache.put(symbol.toUpperCase(), price);
-                return price;
-            }
-
-            return BigDecimal.ZERO;
-
-        } catch (TimeoutException e) {
-            log.error("⏳ [RECOVERY-TIMEOUT] IBKR não respondeu snapshot de {} em 5s.", symbol);
-            return BigDecimal.ZERO;
-        } catch (Exception e) {
-            log.error("❌ [RECOVERY-ERROR] Erro técnico no snapshot de {}: {}", symbol, e.getMessage());
-            return BigDecimal.ZERO;
-        } finally {
-            // 7. Limpeza obrigatória para evitar Memory Leak
-            priceSnapshots.remove(reqId);
-            // Mantemos no marketDataRequests apenas se quisermos que o streaming continue
-        }
-    }
     /**
      * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (Ajustado para Sustentabilidade)
      * Implementa CIRCUIT BREAKER para evitar loops infinitos de rejeição 201.
@@ -341,7 +393,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
             int novoId = orderIdManager.getNextOrderId();
             log.info("📤 [RECOVERY ENVIO] Submetendo mitigação reduzida de {} (ID: {})", symbol, novoId);
-            this.placeOrder(novoId, contract, order);
+            this.placeOrder(String.valueOf(novoId), contract, order);
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -349,6 +401,22 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         } catch (Exception e) {
             log.error("💥 [RECOVERY] Erro crítico no protocolo de emergência para {}: {}", symbol, e.getMessage());
         }
+    }
+
+    // O método getNextOrderId deve ser assim:
+    public int getNextOrderId() {
+        int id = nextValidOrderId.getAndIncrement();
+
+        // 🛡️ TRAVA HEGEMONIA: Se o ID for menor que o cache de segurança do OrderIdManager,
+        // forçamos o uso do ID gerenciado.
+        int currentSafeId = orderIdManager.getCurrentId();
+
+        if (id < currentSafeId) {
+            log.warn("⚠️ [ID-DRIFT] ID incrementado ({}) menor que ID seguro ({}). Ajustando...", id, currentSafeId);
+            nextValidOrderId.set(currentSafeId + 1);
+            return currentSafeId;
+        }
+        return id;
     }
 
 
@@ -368,82 +436,100 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
      * ✅ ETAPA 1: Ativa a "torneira" de dados.
      * Chame este método uma única vez após a conexão ser estabelecida.
      */
-    public void startStreaming() {
-        String accId = this.getAccountId(); // Ou a variável que guarda seu DUN...
-        if (this.getClient() != null && isConnected()) {
-            log.info("🚀 [PONTE | STREAMING] Ativando subscrição contínua para conta: {}", accId);
+//    public void startStreaming() {
+//        String accId = this.getAccountId(); // Ou a variável que guarda seu DUN...
+//        if (this.getClient() != null && isConnected()) {
+//            log.info("🚀 [PONTE | STREAMING] Ativando subscrição contínua para conta: {}", accId);
+//
+//            // 'true' mantém a subscrição aberta. A TWS enviará dados sempre que houver mudança.
+//            this.getClient().reqAccountUpdates(true, accId);
+//        } else {
+//            log.error("❌ [PONTE] Falha ao iniciar streaming: Cliente não conectado.");
+//        }
+//    }
 
-            // 'true' mantém a subscrição aberta. A TWS enviará dados sempre que houver mudança.
-            this.getClient().reqAccountUpdates(true, accId);
-        } else {
-            log.error("❌ [PONTE] Falha ao iniciar streaming: Cliente não conectado.");
-        }
-    }
 
-    /**
-     * Realiza uma simulação preventiva de margem antes do envio real.
-     */
-    public boolean validarMargemPreventiva(Contract contract, Order order) {
-        int reqId = order.orderId();
-        try {
-            log.info("🔍 [PRE-CHECK] Iniciando simulação What-If para {} (ID: {})", contract.symbol(), reqId);
 
-            order.whatIf(true);
-            CompletableFuture<com.example.homegaibkrponte.model.OrderStateDTO> future = new CompletableFuture<>();
-            whatIfFutures.put(reqId, future);
 
-            client.placeOrder(reqId, contract, order);
 
-            // Aguarda a resposta (3 segundos de timeout para sinergia)
-            com.example.homegaibkrponte.model.OrderStateDTO res = future.get(3, TimeUnit.SECONDS);
 
-            if (res != null) {
-                // 📊 LOG DE COMPROVAÇÃO TÉCNICA (Usando seus campos de 'Change' e 'After')
-                log.info("📊 [WHAT-IF TELEMETRIA] Ativo: {} | Mudança Margem Inicial: {} | EL Projetado (After): {}",
-                        contract.symbol(), res.getInitMarginChange(), res.getExcessLiquidityAfter());
 
-                // A lógica de decisão baseada no seu campo excessLiquidityAfter
-                double elProjetado = Double.parseDouble(res.getExcessLiquidityAfter());
 
-                if (elProjetado <= 0) {
-                    log.warn("⚠️ [VETO PREVENTIVO] Simulação REPROVADA. EL projetado de {} é insuficiente.", elProjetado);
-                    return false;
-                }
 
-                log.info("✅ [APROVAÇÃO PREVENTIVA] Margem validada. Prosseguindo com envio real.");
-                return true;
-            }
-            return false;
-        } catch (Exception e) {
-            log.error("❌ [WHAT-IF FALHA] Erro ao processar telemetria para {}: {}", contract.symbol(), e.getMessage());
-            return false;
-        } finally {
-            order.whatIf(false);
-            whatIfFutures.remove(reqId);
-        }
-    }
 
-    public void enviarOrdemComPrevecao(com.example.homegaibkrponte.model.Order ordemPrincipal) {
-        try {
-            com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
-            com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
+//    /**
+//     * Realiza uma simulação preventiva de margem antes do envio real.
+//     */
+//    public boolean validarMargemPreventiva(Contract contract, Order order) {
+//        int reqId = order.orderId();
+//        try {
+//            log.info("🔍 [PRE-CHECK] Iniciando simulação What-If para {} (ID: {})", contract.symbol(), reqId);
+//
+//            order.whatIf(true);
+//            CompletableFuture<OrderStateDTO> future = new CompletableFuture<>();
+//            whatIfFutures.put(reqId, future);
+//
+//            client.placeOrder(reqId, contract, order);
+//
+//            // Aguarda a resposta (3 segundos de timeout para sinergia)
+//            OrderStateDTO res = future.get(3, TimeUnit.SECONDS);
+//
+//            if (res != null) {
+//                // 📊 LOG DE COMPROVAÇÃO TÉCNICA (Usando seus campos de 'Change' e 'After')
+//                log.info("📊 [WHAT-IF TELEMETRIA] Ativo: {} | Mudança Margem Inicial: {} | EL Projetado (After): {}",
+//                        contract.symbol(), res.getInitMarginChange(), res.getExcessLiquidityAfter());
+//
+//                // A lógica de decisão baseada no seu campo excessLiquidityAfter
+//                double elProjetado = Double.parseDouble(res.getExcessLiquidityAfter());
+//
+//                if (elProjetado <= 0) {
+//                    log.warn("⚠️ [VETO PREVENTIVO] Simulação REPROVADA. EL projetado de {} é insuficiente.", elProjetado);
+//                    return false;
+//                }
+//
+//                log.info("✅ [APROVAÇÃO PREVENTIVA] Margem validada. Prosseguindo com envio real.");
+//                return true;
+//            }
+//            return false;
+//        } catch (Exception e) {
+//            log.error("❌ [WHAT-IF FALHA] Erro ao processar telemetria para {}: {}", contract.symbol(), e.getMessage());
+//            return false;
+//        } finally {
+//            order.whatIf(false);
+//            whatIfFutures.remove(reqId);
+//        }
+//    }
+//
+//
 
-            // 1. Tenta validar antes de enviar
-            boolean margemOk = validarMargemPreventiva(contract, ibkrOrder);
 
-            if (margemOk) {
-                // 2. Se OK, envia a ordem real
-                this.placeOrder(ibkrOrder.orderId(), contract, ibkrOrder);
-            } else {
-                // 3. Se falhar, chama a nossa lógica de redução (Fase 1) antes mesmo da rejeição 201 ocorrer
-                log.warn("🔄 [PREVENÇÃO] Margem insuficiente no What-If. Iniciando redução preventiva...");
-                tentarReenvioComReducao(ibkrOrder.orderId(), contract, ibkrOrder);
-            }
 
-        } catch (Exception e) {
-            log.error("❌ Erro no fluxo de envio preventivo: ", e);
-        }
-    }
+
+
+
+
+
+//    public void enviarOrdemComPrevecao(com.example.homegaibkrponte.model.Order ordemPrincipal) {
+//        try {
+//            com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
+//            com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
+//
+//            // 1. Tenta validar antes de enviar
+//            boolean margemOk = validarMargemPreventiva(contract, ibkrOrder);
+//
+//            if (margemOk) {
+//                // 2. Se OK, envia a ordem real
+//                this.placeOrder(String.valueOf(ibkrOrder.orderId()), contract, ibkrOrder);
+//            } else {
+//                // 3. Se falhar, chama a nossa lógica de redução (Fase 1) antes mesmo da rejeição 201 ocorrer
+//                log.warn("🔄 [PREVENÇÃO] Margem insuficiente no What-If. Iniciando redução preventiva...");
+//                tentarReenvioComReducao(ibkrOrder.orderId(), contract, ibkrOrder);
+//            }
+//
+//        } catch (Exception e) {
+//            log.error("❌ Erro no fluxo de envio preventivo: ", e);
+//        }
+//    }
 
 
     @Override
@@ -511,52 +597,55 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
     /**
      * 📡 [PONTE | SMART-ROUTER]
-     * Solicita dados de mercado em tempo real.
-     * Suporta Japão (TSEJ) e EUA (SMART Routing) para failover.
+     * Gerencia subscrições com proteção de memória.
      */
     public void requestMarketData(String symbol) {
-        if (!isConnected()) {
-            log.error("❌ [PONTE] Falha ao assinar {}: Socket não conectado.", symbol);
-            return;
-        }
+        if (!isConnected()) return;
+
+        final String sym = symbol.toUpperCase();
+
+        // 🛡️ EVITA DUPLICIDADE: Se já estamos assinados, não peça de novo
+//        if (marketDataRequests.containsValue(sym)) {
+//            return;
+//        }
 
         try {
             Contract contract = new Contract();
             contract.secType("STK");
+            // ... (Lógica de roteamento regional mantida: TSEJ/SMART) ...
 
-            // 1. 🎛️ LÓGICA DE ROTEAMENTO REGIONAL
-            if (symbol.endsWith(".T")) {
-                // JAPÃO
-                String cleanSymbol = symbol.split("\\.")[0];
-                contract.symbol(cleanSymbol);
-                contract.exchange("TSEJ");
-                contract.primaryExch("TSEJ");
-                contract.currency("JPY");
-                log.info("🎌 [IBKR-ROUTER] Configurando contrato JAPÃO para: {}", symbol);
-            } else {
-                // EUA (Failover do Finnhub)
-                contract.symbol(symbol.toUpperCase());
-                contract.exchange("SMART"); // Roteamento inteligente da IBKR para melhores preços
-                contract.currency("USD");
-                log.info("🇺🇸 [IBKR-ROUTER] Configurando contrato USA para: {}", symbol);
-            }
-
-            // 2. 🚀 DESTRAVA-SINAL (Real-time vs Delayed)
-            // Força a TWS a enviar dados em tempo real se você tiver a assinatura.
-            client.reqMarketDataType(3);
-            log.warn("📡 [MARKET-DATA] Autorizado uso de dados atrasados (Tipo 3) para evitar Custo $0.");
-
-            // 3. 📝 REGISTRO E DISPARO
             int reqId = getNextReqId();
-            marketDataRequests.put(reqId, symbol);
+//            marketDataRequests.put(reqId, sym);
 
-            // Parâmetros: "", false, false -> Assinatura padrão de streaming
+            // 🕒 Snapshot de controle para purga futura (se quiser estender para auto-cancel)
+            beaconTimestampCache.put(sym, System.currentTimeMillis());
+
             client.reqMktData(reqId, contract, "", false, false, null);
 
-//            log.info("✅ [PONTE-SINAL] Subscrição ativa para {} (ReqId: {}) via Canal 115.", symbol, reqId);
-
         } catch (Exception e) {
-            log.error("💥 [PONTE-SINAL] Erro crítico ao rotear {}: {}", symbol, e.getMessage());
+            log.error("💥 [PONTE-MEMORY] Erro ao assinar {}: {}", symbol, e.getMessage());
+        }
+    }
+
+    /**
+     * 🧹 PURGA ATIVA: Cancela dados de mercado para poupar banda e CPU.
+     * Chamado quando um ativo sai da lista de monitoramento do App Principal.
+     */
+    public void cancelMarketData(String symbol) {
+        Integer reqIdToCancel = null;
+        for (Map.Entry<Integer, String> entry : marketDataRequests.entrySet()) {
+            if (entry.getValue().equalsIgnoreCase(symbol)) {
+                reqIdToCancel = entry.getKey();
+                break;
+            }
+        }
+
+        if (reqIdToCancel != null) {
+            client.cancelMktData(reqIdToCancel);
+            marketDataRequests.remove(reqIdToCancel);
+//            beaconPriceCache.remove(symbol.toUpperCase());
+            beaconTimestampCache.remove(symbol.toUpperCase());
+            log.warn("🧹 [HYGIENE] Subscrição de {} cancelada por inatividade.", symbol);
         }
     }
 
@@ -619,7 +708,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
                     orderId, ibkrOrder.action(), contract.symbol(), ibkrOrder.orderType());
 
             // 🚀 [PASSO 4] DISPARO: Envio físico para o socket e registro no cache de recuperação
-            this.placeOrder(orderId, contract, ibkrOrder);
+            this.placeOrder(String.valueOf(orderId), contract, ibkrOrder);
 
         } catch (Exception e) {
             String errorMessage = e.getMessage();
@@ -1102,7 +1191,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
             if (quantity.abs().compareTo(new BigDecimal("0.01")) < 0) {
                 // Logamos apenas em DEBUG para não poluir, mas ignoramos o processamento
-                log.debug("🧹 [FILTRO-PONTE] Poeira detectada em {}: {}. Ignorando sincronia.", ticker, quantity.toPlainString());
+//                log.debug("🧹 [FILTRO-PONTE] Poeira detectada em {}: {}. Ignorando sincronia.", ticker, quantity.toPlainString());
                 return;
             }
 
@@ -1227,22 +1316,35 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         try {
             log.info("📡 [TWS-CONNECT] Recebido ID sugerido pela corretora: {}", orderId);
 
-            // 🛡️ SINERGIA DE SEGURANÇA: Sincroniza IDs e aplica salto preventivo
+            // 🛡️ SINERGIA DE SEGURANÇA: Protocolo Hegemonia V24.5
+            // Aplicamos o salto de 5000 imediatamente para limpar qualquer resíduo da sessão anterior
+            // e garantir que a faixa de IDs seja aceita sem erro 103 (Duplicate ID).
             int currentId = orderIdManager.getCurrentId();
-            int safeId = Math.max(orderId, currentId);
-            orderIdManager.initializeOrUpdate(safeId);
+            int baseId = Math.max(orderId, currentId);
 
-            log.warn("✅ [TWS-SYNC] Próximo ID seguro: {}", orderIdManager.getCurrentId());
+            // Aciona o método sincronizado que você ajustou anteriormente
+            orderIdManager.initializeOrUpdate(baseId);
 
-            // 🧹 LIMPEZA DE FILA NA CORRETORA: Cancela TUDO o que estiver aberto na TWS
+            log.warn("✅ [TWS-SYNC] Salto Institucional aplicado. Próximo ID seguro: {}", orderIdManager.getCurrentId());
+
+            // 🧹 LIMPEZA DE FILA NA CORRETORA:
+            // Vital para garantir que o Buying Power ($ 220k) esteja 100% livre para MSFT
             log.error("🧹 [BOOT-CLEANUP] Limpando ordens pendentes na IBKR para libertar capital institucional...");
-            client.reqGlobalCancel(new OrderCancel());
 
+            // Verificação de segurança para o socket antes do cancelamento global
+            if (client != null && client.isConnected()) {
+                client.reqGlobalCancel(new OrderCancel());
+            }
+
+            // Libera as threads que estavam aguardando a conexão (AccountSyncTask, etc)
             connectionLatch.countDown();
+
+            // 📊 Solicita dados de margem imediatamente após estabilizar o ID
             requestCriticalMarginData();
 
         } catch (Exception e) {
-            log.error("💥 Falha ao limpar fila no nextValidId: {}", e.getMessage());
+            log.error("💥 Falha crítica no handshake de IDs (nextValidId): {}", e.getMessage());
+            // Garantimos o decremento do latch para não travar o boot do sistema
             connectionLatch.countDown();
         }
     }
@@ -1317,74 +1419,109 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
     @Override
     public void historicalDataEnd(int reqId, String startDateStr, String endDateStr) {
-        List<Candle> data = historicalDataBuffers.get(reqId);
+        // 1. Recupera e remove imediatamente do buffer para liberar RAM
+        List<Candle> data = historicalDataBuffers.remove(reqId);
+        String symbol = requestSymbols.remove(reqId); // Limpa o símbolo associado
+
         int total = (data != null) ? data.size() : 0;
+        log.info("✅ [HYGIENE] Buffer histórico destruído para {}. Total: {} candles. RAM liberada.", symbol, total);
 
-        log.info("✅ [PONTE-SOCKET] Carga histórica FINALIZADA para ReqId: {}. Total: {} candles coletados.", reqId, total);
-
-        CompletableFuture<List<Candle>> future = historicalFutures.get(reqId);
+        CompletableFuture<List<Candle>> future = historicalFutures.remove(reqId);
         if (future != null) {
-            // Entrega a lista preenchida para o Controller (e consequentemente para o Principal)
             future.complete(data != null ? data : Collections.emptyList());
         }
     }
+
     @Override
     public void tickPrice(int tickerId, int field, double price, TickAttrib attribs) {
-        // 🛡️ Filtro de Sanidade: Ignora lixo ou preços inválidos
-        if (price <= 0 || price == Double.MAX_VALUE) return;
-
-        // 🎯 [SINERGIA V30.2] LOGICA DE SNAPSHOT (Resgate Síncrono)
-        // Mapeamento: 1=Bid, 4=Last, 9=Close | 66=Delayed Bid, 68=Delayed Last, 75=Delayed Close
-        CompletableFuture<BigDecimal> snapshotFuture = priceSnapshots.get(tickerId);
-        if (snapshotFuture != null) {
-            if (field == 1 || field == 4 || field == 9 || field == 66 || field == 68 || field == 75) {
-                snapshotFuture.complete(BigDecimal.valueOf(price));
-                log.info("🎯 [SNAPSHOT-FILL] Preço recuperado (Field {}): ReqId {} @ ${}", field, tickerId, price);
-            }
-        }
-
-        // 🔍 Localiza o símbolo associado a esta subscrição
-        String symbol = marketDataRequests.get(tickerId);
-        if (symbol == null) return;
-
-        // 1. Atualiza o cache local de preços (SSOT da Ponte)
-        BigDecimal currentPrice = BigDecimal.valueOf(price);
-        marketPriceCache.put(symbol, currentPrice);
-
-        // Injeta também no cache do LivePortfolioService para sinergia imediata
-        portfolioService.getAccountValuesCache().put(symbol.toUpperCase() + "_PRICE", currentPrice);
-
-        // 2. 🎛️ COMPOSIÇÃO DE MICROESTRUTURA (Bid/Ask/Last)
-        BigDecimal[] buffer = microBuffer.computeIfAbsent(symbol, k -> new BigDecimal[]{null, null, null});
-
-        // Suporta tanto campos Real-Time quanto os equivalentes Delayed (66, 67, 68)
-        switch (field) {
-            case 1, 66: buffer[0] = currentPrice; break; // BID / DELAYED BID
-            case 2, 67: buffer[1] = currentPrice; break; // ASK / DELAYED ASK
-            case 4, 68: buffer[2] = currentPrice; break; // LAST / DELAYED LAST
-        }
-
-        // 🎯 FILTRO DE DISPARO (PASSTHROUGH PARA O PRINCIPAL)
-        if (field == 1 || field == 2 || field == 4 || field == 66 || field == 67 || field == 68) {
-
-            Long lastSize = 1L;
-
-            // 🚀 ENVIO SINÉRGICO PARA O PRINCIPAL (H.O.M.E.)
-            webhookNotifier.sendMarketTick(
-                    symbol,
-                    buffer[2] != null ? buffer[2] : currentPrice, // Last
-                    buffer[0] != null ? buffer[0] : currentPrice, // Bid
-                    buffer[1] != null ? buffer[1] : currentPrice, // Ask
-                    lastSize
-            );
-
-            // Log de Monitoramento: Diferencia a origem do dado para auditoria
-            if (field == 4 || field == 68) {
-                log.info("🛰️ [TICK-FLOW] {} -> ${} | Source: {}",
-                        symbol, price, (field > 60 ? "DELAYED" : "LIVE"));
+        // A Ponte não deve mais processar ticks detalhados para o Principal.
+        // O Principal já recebe isso via Finnhub.
+        // Se precisar de preço para ordens, use o que está no marketPriceCache (atualizado por streaming de conta).
+        if (price > 0) {
+            String symbol = marketDataRequests.get(tickerId);
+            if (symbol != null) {
+                marketPriceCache.put(symbol.toUpperCase(), BigDecimal.valueOf(price));
             }
         }
     }
+
+//    @Override
+//    public void tickPrice(int tickerId, int field, double price, TickAttrib attribs) {
+//        // 1. Filtragem de Ruído: Ignora preços inválidos ou "poeira" de rede
+//        if (price <= 0 || price == Double.MAX_VALUE) return;
+//
+//        // 2. Resgate de Snapshot (Prioridade alta para destravar threads de precificação)
+//        CompletableFuture<BigDecimal> snapshotFuture = priceSnapshots.get(tickerId);
+//        if (snapshotFuture != null && (field == 1 || field == 4 || field == 68)) {
+//            snapshotFuture.complete(BigDecimal.valueOf(price));
+//        }
+//
+//        String symbol = marketDataRequests.get(tickerId);
+//        if (symbol == null) return;
+//
+//        BigDecimal currentPrice = BigDecimal.valueOf(price);
+//        long now = System.currentTimeMillis();
+//
+//        // 🕒 [PASSO 1] BEACON (Cache de Latência Zero)
+//        // Atualiza a memória local imediatamente para que o Principal leia via GET em 0ms
+//        if (field == 1 || field == 2 || field == 4 || field == 68 || field == 9) {
+//            beaconPriceCache.put(symbol, currentPrice);
+//            beaconTimestampCache.put(symbol, now);
+//            marketPriceCache.put(symbol, currentPrice);
+//            portfolioService.getAccountValuesCache().put(symbol.toUpperCase() + "_PRICE", currentPrice);
+//        }
+//
+//        // 🚀 [PASSO 5] WEBHOOK INTELIGENTE (Controle de Pressão)
+//        // Só envia via Webhook se for Bid(1/66), Ask(2/67) ou Last(4/68)
+//        if (field == 1 || field == 2 || field == 4 || field == 66 || field == 67 || field == 68) {
+//            BigDecimal[] buffer = microBuffer.computeIfAbsent(symbol, k -> new BigDecimal[]{null, null, null});
+//
+//            // Atualiza o micro-buffer atômico
+//            switch (field) {
+//                case 1, 66 -> buffer[0] = currentPrice;
+//                case 2, 67 -> buffer[1] = currentPrice;
+//                case 4, 68 -> buffer[2] = currentPrice;
+//            }
+//
+//            // 🛡️ FILTRO DE FREQUÊNCIA (Throttling):
+//            // Não envia Webhook para o mesmo ativo mais de uma vez a cada 100ms.
+//            // O Beacon (acima) já está atualizado, então o Principal não perde o preço real.
+//            // Isso evita o "atropelo" de threads no App Principal (8080).
+//            Long lastPush = beaconTimestampCache.get(symbol + "_PUSH");
+//            if (lastPush == null || (now - lastPush) > 100) {
+//
+//                webhookNotifier.sendMarketTick(symbol,
+//                        buffer[2] != null ? buffer[2] : currentPrice, // Last
+//                        buffer[0] != null ? buffer[0] : currentPrice, // Bid
+//                        buffer[1] != null ? buffer[1] : currentPrice, // Ask
+//                        1L);
+//
+//                beaconTimestampCache.put(symbol + "_PUSH", now);
+//            }
+//
+//            // 📝 Auditoria Trace (Apenas se necessário)
+//            if (log.isTraceEnabled() && (field == 4 || field == 68)) {
+//                log.trace("🛰️ [TICK-FLOW] {} -> ${}", symbol, price);
+//            }
+//        }
+//    }
+
+    /**
+     * 🛰️ MÉTODO DE ACESSO RÁPIDO (SINERGIA PASSO 1)
+     * Permite que qualquer serviço consulte o último preço do Streaming sem latência de rede.
+     */
+    public BigDecimal getStreamingPrice(String symbol) {
+        String sym = symbol.toUpperCase();
+        Long ts = beaconTimestampCache.get(sym);
+
+        // 🛡️ Se o dado for mais velho que 2 segundos, o pulso falhou.
+        // Retornamos NULL para o Principal saber que não deve operar às cegas.
+        if (ts == null || (System.currentTimeMillis() - ts) > 2000) {
+            return null;
+        }
+        return beaconPriceCache.get(sym);
+    }
+
 
     @Override public void updateMktDepth(int i, int i1, int i2, int i3, double v, Decimal decimal) {}
     @Override public void updateMktDepthL2(int i, int i1, String s, int i2, int i3, double v, Decimal decimal, boolean b) {}
@@ -1398,6 +1535,8 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         log.info("➡️ [PONTE | SNAPSHOT] Requisitado Account Summary com reqId {}. (Usando Grupo: 'All').", reqId);
         return reqId;
     }
+
+
 
     /**
      * Cancela a última requisição de resumo de conta ativa.
@@ -1483,7 +1622,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             }
 
             // 4. Logs de depuração (Mantido)
-            log.debug("📊 [PONTE | SNAPSHOT-IN] Account Summary Processado: {} = R$ {}", tag, accountValue.toPlainString());
+//            log.debug("📊 [PONTE | SNAPSHOT-IN] Account Summary Processado: {} = R$ {}", tag, accountValue.toPlainString());
 
             // ✅ AJUSTE CRÍTICO: CHAMA O CÁLCULO MANUAL COMO FALLBACK
             // Se um dos componentes necessários para o cálculo chegar, tentamos calcular o EL.
@@ -1536,6 +1675,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             priceSnapshots.remove(reqId);
         }
     }
+
 
 
     @Override

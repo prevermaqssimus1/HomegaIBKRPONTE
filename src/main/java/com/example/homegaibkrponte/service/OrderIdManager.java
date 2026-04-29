@@ -33,11 +33,14 @@ public class OrderIdManager {
      * Sincroniza o ID com Salto de Segurança.
      */
     public synchronized void initializeOrUpdate(int validId) {
-        int safeId = validId + 2000;
+        // Aumentamos para 5000 para limpar qualquer cache residual da TWS/Gateway
+        int safeId = validId + 5000;
         int current = this.nextOrderId.get();
+
         if (safeId > current) {
             this.nextOrderId.set(safeId);
-            log.error("✅ [OrderIdManager] ID sincronizado com SALTO DE SEGURANÇA. Próximo ID: {}", safeId);
+            // Log como ERROR para destacar no console durante o pregão
+            log.error("🚀🚀 [ID-FORCE-JUMP] Salto de emergência aplicado. Novo ID inicial: {}", safeId);
         }
     }
 

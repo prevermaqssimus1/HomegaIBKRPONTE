@@ -35,15 +35,23 @@ public class IBKRExecutionService implements ExecutionService {
         }
 
         try {
-            log.warn("🚀 [EXEC RESGATE] Preparando ordem de emergência para {} (Valor: R$ {}).",
+            log.warn("🚀 [EXEC RESGATE] Preparando ordem de emergência para {} (Valor: ${}).",
                     emergencyOrder.getSymbol(), positionToLiquidate.getMarketValue().toPlainString());
 
+            // 1. Mapeia a ordem para o padrão IBKR
             com.ib.client.Order ibkrOrder = orderMapper.mapEmergencyOrderToIbkrOrder(emergencyOrder, positionToLiquidate);
             Contract contract = createContractFromPosition(positionToLiquidate);
 
-            connector.placeOrder(ibkrOrder.orderId(), contract, ibkrOrder);
+            // 2. 🛡️ AJUSTE CRÍTICO: Recuperamos o ID de texto da ordem de emergência
+            // Se a EmergencyOrder não tiver um ClientID, geramos um prefixo de resgate
+            String principalClientId = (emergencyOrder.getClientId() != null) ?
+                    emergencyOrder.getClientId() : "RESCUE-" + emergencyOrder.getSymbol() + "-" + System.currentTimeMillis();
 
-            log.info("✅ [EXEC RESGATE] Ordem submetida com CashQty. ID IBKR: {}", ibkrOrder.orderId());
+            // 3. ✅ DESPACHO SINCROZINADO:
+            // Passamos o ClientID (String) para o novo método que gera o ID numérico internamente.
+            connector.placeOrder(principalClientId, contract, ibkrOrder);
+
+            log.info("✅ [EXEC RESGATE] Ordem submetida com sucesso. Ref: {}", principalClientId);
             return PortfolioUpdateResult.success("Ordem de resgate enviada.");
 
         } catch (Exception e) {
@@ -54,33 +62,35 @@ public class IBKRExecutionService implements ExecutionService {
 
     /**
      * 🚀 EFETIVAÇÃO DO ENVIO (TRADING NORMAL EUA/JAPÃO)
-     * Este método agora é o motor que despacha as ordens do Orquestrador.
+     * AJUSTADO: Não usa mais Integer.parseInt no clientOrderId.
+     * Delega a geração do ID numérico ao Connector e usa a String para rastreio.
      */
-
     public PortfolioUpdateResult executeNewOrder(Order order) {
         try {
             log.info("▶️ [EXEC NORMAL] Iniciando despacho de {} para a IBKR...", order.symbol());
 
-            // 1. Criar o Contrato Inteligente (Lógica de Moeda e Bolsa integrada no Mapper)
-            // Se symbol termina com .T -> JPY/TSEJ | Se não -> USD/SMART
+            // 1. Criar o Contrato Inteligente
             Contract contract = orderMapper.toContract(order.symbol());
 
-            // 2. Extrair o ID da Ordem do contrato Principal
-            int orderId = Integer.parseInt(order.clientOrderId());
+            // 2. 🛡️ AJUSTE CRÍTICO: Não tentamos mais converter "HEG_OPEN_MSFT..." em int.
+            // Guardamos o ID de texto original para passar ao Connector.
+            String principalClientId = order.clientOrderId();
 
-            // 3. Criar a Ordem IBKR baseada em QUANTIDADE (Shares)
-            // Diferente do resgate, aqui usamos unidades físicas calculadas pelo Sizing.
+            // 3. Criar a Ordem IBKR
+            // O orderId aqui pode ser 0 ou o próximo do connector,
+            // pois o método final 'connector.placeOrder' irá sobrescrever com o ID numérico correto.
             com.ib.client.Order ibkrOrder = orderMapper.mapToIbkrOrder(
-                    orderId,
+                    0, // ID temporário
                     order.side().toString(),
                     order.quantity()
             );
 
-            // 4. DESPACHO FÍSICO PARA A TWS/GATEWAY
-            connector.placeOrder(orderId, contract, ibkrOrder);
+            // 4. DESPACHO FÍSICO PARA O CONNECTOR
+            // ✅ AGORA USAMOS A ASSINATURA: placeOrder(String, Contract, Order)
+            connector.placeOrder(principalClientId, contract, ibkrOrder);
 
-            log.warn("📬📬📬 [DESPACHADO] Ordem de {} enviada! ID: {} | Qtd: {} | Lado: {}",
-                    order.symbol(), orderId, order.quantity(), order.side());
+            log.warn("📬📬📬📬📬 [DESPACHADO] Ordem de {} enviada! Ref: {} | Qtd: {} | Lado: {}",
+                    order.symbol(), principalClientId, order.quantity(), order.side());
 
             return PortfolioUpdateResult.success("Ordem enviada com sucesso para a fila da corretora.");
 

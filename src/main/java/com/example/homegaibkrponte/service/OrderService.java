@@ -78,71 +78,66 @@ public class OrderService {
 
     // --- LÓGICA SIMPLES (PREVENÇÃO DE ERRO 103) ---
 
+    // 1. Adicione a dependência no topo da classe
+    private final OrderLockManager orderLockManager; // Certifique-se de injetar via construtor
+
     private OrderDTO handleSimpleOrder(OrderDTO orderDto, boolean isReduction) {
+        String symbol = orderDto.symbol().toUpperCase();
+
+        // 🛡️ [AJUSTE PASSO 2] Verificação de Lock
+        // Se for uma redução/ejeção e o ativo estiver travado, abortamos imediatamente.
+        if (isReduction && orderLockManager.isLocked(symbol)) {
+            log.warn("🚦 [ORDER-LOCK-VETO] Ejeção duplicada evitada para {}. Aguarde o cooldown de 5s.", symbol);
+            throw new IllegalStateException("Ordem de ejeção em processamento para " + symbol);
+        }
+
         int tempId = orderIdManager.getNextOrderId();
         Contract contract = contractFactory.create(orderDto.symbol());
+
         BigDecimal executionPrice = portfolioService.getPriceForOrder(orderDto.symbol());
 
-        // 🛡️ SINERGIA: Garante que ordens com a tag de urgência sejam tratadas como redução de risco
         boolean isUrgente = isReduction ||
+                (orderDto.clientOrderId() != null && orderDto.clientOrderId().contains("CLOSE")) ||
                 (orderDto.rationale() != null && orderDto.rationale().contains("[URGENT-CLOSE]"));
 
-        OrderDTO finalDto = orderDto;
-        if (orderDto.price() == null || orderDto.price().signum() <= 0) {
-            finalDto = orderDto.withPrice(executionPrice);
-        }
+        OrderDTO finalDto = (orderDto.price() == null || orderDto.price().signum() <= 0)
+                ? orderDto.withPrice(executionPrice) : orderDto;
 
         Order ibkrOrder = orderFactory.create(finalDto, String.valueOf(tempId));
 
-        // ✅ PRIORIDADE ABSOLUTA: Se for fechamento, ignoramos restrições de preço da corretora
         if (isUrgente) {
             ibkrOrder.overridePercentageConstraints(true);
-            log.warn("🛡️ [RECOVERY-MODE] Ativando Liquidação de Emergência para {}. Ignorando travas de preço.", finalDto.symbol());
+            log.warn("🛡️ [RECOVERY-MODE] Ejeção de emergência para {}. Travas ignoradas.", finalDto.symbol());
         }
 
         try {
-            log.info("🔍 [PRE-CHECK] Simulando margem para {} (ID: {})", finalDto.symbol(), tempId);
-            boolean temMargem = connector.validarMargemPreventiva(contract, ibkrOrder);
-
             int finalOrderId = orderIdManager.getNextOrderId();
             ibkrOrder.orderId(finalOrderId);
             orderIdManager.linkIds(finalDto.clientOrderId(), finalOrderId);
 
-            if (!temMargem) {
-                double qtdOriginal = ibkrOrder.totalQuantity().value().doubleValue();
-
-                // 🔥 EFEITO CUNHA: Se for urgente (fechar short), tentamos apenas 10%.
-                // Se for abertura comum, tentamos 60%.
-                double fatorReducao = isUrgente ? 0.10 : 0.60;
-                double novaQtd = Math.max(1.0, Math.floor(qtdOriginal * fatorReducao));
-
-                String elProjetado = connector.getLastWhatIfExcessLiquidity();
-
-                log.warn("📉 [MARGIN-FATAL] Margem insuficiente para {}. Aplicando FRACIONAMENTO: {} -> {} | Motivo: {}",
-                        finalDto.symbol(), qtdOriginal, novaQtd, isUrgente ? "LIQUIDAÇÃO_URGENTE" : "ADAPTIVE_ENTRY");
-
-                ibkrOrder.totalQuantity(Decimal.get(novaQtd));
-                webhookNotifier.sendAdaptiveCheckAlert(finalDto.symbol(), qtdOriginal, novaQtd, "Recuperação de Margem 201");
-            }
-
-            BigDecimal custoReal = BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue())
-                    .multiply(executionPrice).abs();
-
-            log.info("📦 [TWS-OUT] Despachando {} | Qtd Final: {} | Preço: ${} | Custo: ${}",
-                    finalDto.symbol(), ibkrOrder.totalQuantity().value(), executionPrice, custoReal);
+            log.info("📦 [TWS-OUT] Despachando {} | Qtd: {} | Preço: ${}",
+                    finalDto.symbol(), ibkrOrder.totalQuantity().value(), executionPrice);
 
             portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(),
-                    BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue()), executionPrice);
+                    BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue()),
+                    executionPrice);
 
-            connector.placeOrder(finalOrderId, contract, ibkrOrder);
+            // Disparo imediato na Ponte
+            connector.placeOrder(String.valueOf(finalOrderId), contract, ibkrOrder);
+
+            // 🛡️ [AJUSTE PASSO 2.1] Bloqueio pós-envio
+            // Tranca o símbolo apenas se for uma ordem de redução/ejeção para evitar reentrada frenética
+            if (isReduction) {
+                orderLockManager.lock(symbol);
+            }
+
             return finalDto.withOrderId(finalOrderId);
 
         } catch (Exception e) {
-            log.error("💥 [FATAL-ORDER-FLOW] Erro ao processar {}: {}", finalDto.symbol(), e.getMessage());
+            log.error("💥 [FATAL-ORDER-FLOW] Falha no despacho de {}: {}", finalDto.symbol(), e.getMessage());
             throw new RuntimeException("Falha no fluxo de ordem da Ponte", e);
         }
     }
-
     private OrderDTO handleBracketOrder(OrderDTO masterOrderDto) {
         Contract contract = contractFactory.create(masterOrderDto.symbol());
         int masterId = orderIdManager.getNextOrderId();
@@ -162,9 +157,9 @@ public class OrderService {
         slOrder.transmit(false);
         tpOrder.transmit(true);
 
-        connector.placeOrder(masterId, contract, parentOrder);
-        connector.placeOrder(slId, contract, slOrder);
-        connector.placeOrder(tpId, contract, tpOrder);
+        connector.placeOrder(String.valueOf(masterId), contract, parentOrder);
+        connector.placeOrder(String.valueOf(slId), contract, slOrder);
+        connector.placeOrder(String.valueOf(tpId), contract, tpOrder);
 
         return masterOrderDto.withOrderId(masterId)
                 .withChildOrders(List.of(slDto.withOrderId(slId), tpDto.withOrderId(tpId)));

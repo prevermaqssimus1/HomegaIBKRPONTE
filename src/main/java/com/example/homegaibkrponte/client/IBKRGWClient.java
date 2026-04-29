@@ -28,10 +28,13 @@ public class IBKRGWClient {
         synchronized (orderQueueLock) {
             try {
                 // 🚨 VALIDAÇÃO DO PREÇO (O QUE ESTAVA DANDO ERRO)
-                if (price == null || price.signum() <= 0) {
-                    log.error("💥 [PONTE] Falha: Venda de {} requer preço válido (LMT/MKT-Prot).", symbol);
-                    return new OrderExecutionResult(false, "Ordem LMT requer preço válido.");
+                // Altere a validação de preço para:
+                if ((price == null || price.signum() <= 0) && !action.contains("MARKET")) {
+                    log.error("💥 [PONTE] Falha: Ordem LMT de {} requer preço válido.", symbol);
+                    return new OrderExecutionResult(false, "Preço inválido.");
                 }
+
+
 
                 if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");
 

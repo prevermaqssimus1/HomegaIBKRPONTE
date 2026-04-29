@@ -16,11 +16,12 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
- * SERVIÇO NA PONTE IBKR (BRIDGE)
- * Central de Notificações para o sistema Principal.
- * Ajustado para suportar alertas de liquidez e telemetria Japão (.T).
+ * 🛰️ WEBHOOK NOTIFIER SERVICE - VERSÃO CONSOLIDADA V5.5 (SNIPER + RISK)
+ * Equalização total: Combina Latência Mínima (Sniper) com Telemetria de Risco.
  */
 @Service
 @Slf4j
@@ -34,7 +35,11 @@ public class WebhookNotifierService {
     private static final String RISK_SYNC_URI = "/api/risk/sync-adjustment";
     private static final String LIQUIDITY_ALERT_URI = "/webhook/alert/liquidity";
 
-    private final Retry retrySpec = Retry.backoff(3, Duration.ofSeconds(2));
+    // No topo da classe
+    private final ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+    // ⚡ RETRY SNIPER: 3 tentativas com backoff de 200ms para liberar threads rapidamente.
+    private final Retry fastRetry = Retry.backoff(3, Duration.ofMillis(200));
 
     public WebhookNotifierService(
             @Value("${homega.app.webhook.base-url:http://127.0.0.1:8080}") String baseUrl
@@ -42,11 +47,44 @@ public class WebhookNotifierService {
         this.webClient = WebClient.builder()
                 .baseUrl(baseUrl)
                 .build();
-        log.info("🔔 [PONTE] Notificador configurado para: {}", baseUrl);
+        log.info("🔔 [PONTE-ESTÁVEL] Sniper & Risk Manager ativo em: {}", baseUrl);
     }
 
     /**
-     * ✅ RESOLVE ERRO 1: Notifica reduções preventivas (What-If).
+     * 🎌 ENVIO DE TICK SNIPER (Ultra Baixa Latência)
+     */
+    /**
+     * 🎌 ENVIO DE TICK SNIPER (Ultra Baixa Latência - Passo 5)
+     * Ajustado para Fire-and-Forget total.
+     */
+    public void sendMarketTick(String symbol, BigDecimal price, BigDecimal bid, BigDecimal ask, Long size) {
+        virtualExecutor.submit(() -> {
+            try {
+                BigDecimal validBid = (bid != null) ? bid : price;
+                BigDecimal validAsk = (ask != null) ? ask : price;
+                Long timestamp = System.currentTimeMillis();
+
+                MarketTickDTO tick = new MarketTickDTO(symbol, price, validBid, validAsk, size != null ? size : 0L, timestamp);
+
+                this.webClient.post()
+                        .uri(MARKET_TICK_URI)
+                        .bodyValue(tick)
+                        .retrieve()
+                        .toBodilessEntity()
+                        .timeout(Duration.ofMillis(100)) // ⚡ Timeout agressivo: Se o Principal não ouvir em 100ms, ignore.
+                        .subscribe(
+                                null,
+                                err -> {} // Silêncio total em erro de tick para poupar log
+                        );
+            } catch (Exception e) {
+                // Engole a exceção: Ticks são voláteis, o próximo chegará em ms.
+            }
+        });
+    }
+
+    /**
+     * 🛡️ TELEMETRIA DE ADAPTIVE CHECK (What-If)
+     * Notifica quando o AMC reduz quantidades preventivamente.
      */
     public void sendAdaptiveCheckAlert(String symbol, double originalQty, double reducedQty, String elAfter) {
         Map<String, Object> payload = new HashMap<>();
@@ -62,14 +100,62 @@ public class WebhookNotifierService {
                 .bodyValue(payload)
                 .retrieve()
                 .toBodilessEntity()
+                .retryWhen(fastRetry)
                 .subscribe(
-                        res -> log.info("✅ [AMC] Telemetria de redução enviada: {}", symbol),
-                        err -> log.error("❌ [AMC] Falha ao enviar telemetria.")
+                        res -> log.info("✅ [AMC-SYNC] Telemetria enviada: {}", symbol),
+                        err -> log.error("❌ [AMC-SYNC] Falha no reporte de redução: {}", symbol)
                 );
     }
 
     /**
-     * ✅ RESOLVE ERRO 2 e 3: Alertas de Liquidez (Warning).
+     * 🚀 REJEIÇÃO (Sinergizada) - Usa fastRetry para liberar capital no Winston
+     */
+    public void sendOrderRejection(String clientOrderId, long brokerOrderId, int errorCode, String reason) {
+        OrderRejectionDto rejection = new OrderRejectionDto(clientOrderId, brokerOrderId, errorCode, reason);
+        enviarRejeicao(rejection);
+    }
+
+    public void sendOrderRejection(long orderId, int errorCode, String reason) {
+        OrderRejectionDto rejection = new OrderRejectionDto(orderId, errorCode, reason);
+        enviarRejeicao(rejection);
+    }
+
+    private void enviarRejeicao(OrderRejectionDto dto) {
+        this.webClient.post()
+                .uri(REJECTION_URI)
+                .bodyValue(dto)
+                .retrieve()
+                .toBodilessEntity()
+                .retryWhen(fastRetry)
+                .subscribe(
+                        success -> log.info("✅ [REJECT-OUT] Entregue: {}", dto.getClientOrderId() != null ? dto.getClientOrderId() : dto.getOrderId()),
+                        err -> log.error("❌ [REJECT-OUT] Falha fatal na entrega do erro.")
+                );
+    }
+
+    /**
+     * 💸 EXECUÇÃO (FILL) - Sincronia de saldo real
+     */
+    /**
+     * 💸 EXECUÇÃO (FILL) - Passo 5
+     * Envio isolado para garantir que a thread da TWS volte a operar instantaneamente.
+     */
+    public void sendExecutionReport(ExecutionReportDto report) {
+        virtualExecutor.submit(() -> {
+            this.webClient.post()
+                    .uri(EXECUTION_STATUS_URI)
+                    .bodyValue(report)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .retryWhen(fastRetry) // Mantém o retry para integridade do saldo
+                    .subscribe(
+                            res -> log.info("✅ [FILL-SYNC] {} reportado via VirtualThread.", report.getSymbol()),
+                            err -> log.error("❌ [FILL-SYNC] Falha crítica ao sincronizar execução após retries.")
+                    );
+        });
+    }
+    /**
+     * ⚠️ ALERTAS DE LIQUIDEZ (Warnings e Critical)
      */
     public void notifyWarningLiquidity(String message) {
         sendLiquidityAlert("WARNING", message);
@@ -91,98 +177,8 @@ public class WebhookNotifierService {
                 .retrieve()
                 .toBodilessEntity()
                 .subscribe(
-                        res -> log.info("✅ [ALERTA] {} enviado ao Principal.", level),
+                        res -> log.warn("🚨 [ALERTA-{}] Sincronizado com Principal.", level),
                         err -> log.trace("Falha silenciada no alerta de liquidez.")
                 );
-    }
-
-    /**
-     * 🎌 ENVIO DE TICK REAL-TIME EVOLUÍDO (Oráculo v3.0)
-     * Agora transporta bid, ask e volume para análise de microestrutura.
-     */
-    public void sendMarketTick(String symbol, BigDecimal price, BigDecimal bid, BigDecimal ask, Long size) {
-        // 🛡️ Validação de sanidade para evitar nulidade no Ring Buffer do Principal
-        BigDecimal validBid = (bid != null) ? bid : price;
-        BigDecimal validAsk = (ask != null) ? ask : price;
-        Long validSize = (size != null) ? size : 0L;
-        Long timestamp = System.currentTimeMillis();
-
-        // Criamos o DTO completo com o novo contrato
-        MarketTickDTO tick = new MarketTickDTO(
-                symbol,
-                price,
-                validBid,
-                validAsk,
-                validSize,
-                timestamp
-        );
-
-        this.webClient.post()
-                .uri(MARKET_TICK_URI) // Rota: /api/bridge/data/tick
-                .bodyValue(tick)
-                .retrieve()
-                .onStatus(HttpStatusCode::isError, response -> {
-                    log.trace("⚠️ [TICK-DROP] Falha na entrega para {}. Status: {}", symbol, response.statusCode());
-                    return Mono.empty();
-                })
-                .toBodilessEntity()
-                .timeout(Duration.ofMillis(300)) // 🛡️ ROTA SNIPER: Latência reduzida para 300ms
-                .subscribe(
-                        success -> {}, // Sucesso silencioso para não poluir logs de alta frequência
-                        err -> log.trace("Tick de {} dropado por timeout ou rede.", symbol)
-                );
-    }
-
-    /**
-     * Notifica rejeições (Trata erro 162 de IP).
-     */
-    public void sendOrderRejection(long orderId, int errorCode, String reason) {
-        OrderRejectionDto rejection = new OrderRejectionDto(orderId, errorCode, reason);
-        this.webClient.post()
-                .uri(REJECTION_URI)
-                .bodyValue(rejection)
-                .retrieve()
-                .toBodilessEntity()
-                .retryWhen(retrySpec)
-                .subscribe();
-    }
-
-    /**
-     * 🚀 NOVO MÉTODO SINERGIZADO: Notifica rejeições enviando o ClientID real (String).
-     * Essencial para o Winston encontrar a reserva de capital e limpar o Buying Power.
-     */
-    public void sendOrderRejection(String clientOrderId, long brokerOrderId, int errorCode, String reason) {
-        // Usa o novo construtor que mapeia a String original do Winston
-        OrderRejectionDto rejection = new OrderRejectionDto(clientOrderId, brokerOrderId, errorCode, reason);
-        dispararPostRejection(rejection);
-    }
-
-    /**
-     * Helper privado para centralizar o envio e evitar repetição de lógica.
-     */
-    private void dispararPostRejection(OrderRejectionDto rejection) {
-        this.webClient.post()
-                .uri(REJECTION_URI)
-                .bodyValue(rejection)
-                .retrieve()
-                .toBodilessEntity()
-                .retryWhen(retrySpec)
-                .subscribe(
-                        success -> log.info("✅ [WEBHOOK-OUT] Rejeição entregue: {}", rejection.getClientOrderId()),
-                        err -> log.error("❌ [WEBHOOK-OUT] Falha ao entregar rejeição: {}", err.getMessage())
-                );
-    }
-
-    /**
-     * Notifica execuções reais (FILL).
-     */
-    public void sendExecutionReport(ExecutionReportDto report) {
-        this.webClient.post()
-                .uri(EXECUTION_STATUS_URI)
-                .bodyValue(report)
-                .retrieve()
-                .toBodilessEntity()
-                .retryWhen(retrySpec)
-                .subscribe();
     }
 }

@@ -81,52 +81,76 @@ public class OrderService {
     // 1. Adicione a dependência no topo da classe
     private final OrderLockManager orderLockManager; // Certifique-se de injetar via construtor
 
+    /**
+     * 🛠️ HANDLE SIMPLE ORDER V3.0 - SINERGIA HÍBRIDA & BYPASS MKT
+     * Sinergia: Confia no preço do Principal, mas aceita "cegueira" para ordens MARKET.
+     * Proteção: Blindagem contra Erro 103 (Duplicate ID) e Double-Ejection.
+     */
     private OrderDTO handleSimpleOrder(OrderDTO orderDto, boolean isReduction) {
         String symbol = orderDto.symbol().toUpperCase();
+        OrderTypeEnum typeEnum = orderDto.getTypeAsEnum();
 
-        // 🛡️ [AJUSTE PASSO 2] Verificação de Lock
-        // Se for uma redução/ejeção e o ativo estiver travado, abortamos imediatamente.
+        // 🛡️ 1. PROTEÇÃO DE LOCK (Prevenção de Spam de Ejeção)
         if (isReduction && orderLockManager.isLocked(symbol)) {
-            log.warn("🚦 [ORDER-LOCK-VETO] Ejeção duplicada evitada para {}. Aguarde o cooldown de 5s.", symbol);
+            log.warn("🚦 [ORDER-LOCK-VETO] Ejeção duplicada evitada para {}. Já existe uma missão em curso.", symbol);
             throw new IllegalStateException("Ordem de ejeção em processamento para " + symbol);
         }
 
-        int tempId = orderIdManager.getNextOrderId();
         Contract contract = contractFactory.create(orderDto.symbol());
 
-        BigDecimal executionPrice = portfolioService.getPriceForOrder(orderDto.symbol());
+        // 🎯 2. LÓGICA DE SOBERANIA DE PREÇO
+        // Tenta usar limitPrice ou price enviados pelo Principal (Soberania do DTO)
+        BigDecimal executionPrice = orderDto.limitPrice() != null ? orderDto.limitPrice() : orderDto.price();
 
-        boolean isUrgente = isReduction ||
-                (orderDto.clientOrderId() != null && orderDto.clientOrderId().contains("CLOSE")) ||
-                (orderDto.rationale() != null && orderDto.rationale().contains("[URGENT-CLOSE]"));
+        // 🔓 3. PROTOCOLO DE BYPASS PARA ORDENS MARKET
+        boolean isMarket = (typeEnum != null && typeEnum.isMarketOrder());
 
+        if (!isMarket) {
+            // Se NÃO for Market, o preço é MANDATÓRIO
+            if (executionPrice == null || executionPrice.signum() <= 0) {
+                log.warn("⚠️ [DTO-PRICE-MISSING] Ordem LIMIT para {} sem preço. Consultando cache local...", symbol);
+                executionPrice = portfolioService.getPriceForOrder(symbol);
+            }
+
+            if (executionPrice == null || executionPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                log.error("🛑 [CRITICAL-PRICE-MISSING] Falha total de precificação LIMIT para {}. Abortando.", symbol);
+                throw new IllegalStateException("Cegueira de preço detectada na Ponte para " + symbol);
+            }
+        } else {
+            // Se FOR Market, o preço é apenas ilustrativo para o rastreio (tracking)
+            if (executionPrice == null || executionPrice.signum() <= 0) {
+                executionPrice = BigDecimal.ZERO;
+                log.warn("🔓 [MARKET-BYPASS] Ejeção a mercado de {} autorizada sem preço de referência.", symbol);
+            }
+        }
+
+        // 🔄 4. SINCRONIZAÇÃO DO DTO FINAL
         OrderDTO finalDto = (orderDto.price() == null || orderDto.price().signum() <= 0)
                 ? orderDto.withPrice(executionPrice) : orderDto;
 
-        Order ibkrOrder = orderFactory.create(finalDto, String.valueOf(tempId));
-
-        if (isUrgente) {
-            ibkrOrder.overridePercentageConstraints(true);
-            log.warn("🛡️ [RECOVERY-MODE] Ejeção de emergência para {}. Travas ignoradas.", finalDto.symbol());
-        }
-
+        // 🚀 5. PREPARAÇÃO E TRANSMISSÃO TWS
         try {
             int finalOrderId = orderIdManager.getNextOrderId();
-            ibkrOrder.orderId(finalOrderId);
+            Order ibkrOrder = orderFactory.create(finalDto, String.valueOf(finalOrderId));
+
+            // Vincula IDs para o rádio (Callback)
             orderIdManager.linkIds(finalDto.clientOrderId(), finalOrderId);
 
-            log.info("📦 [TWS-OUT] Despachando {} | Qtd: {} | Preço: ${}",
-                    finalDto.symbol(), ibkrOrder.totalQuantity().value(), executionPrice);
+            log.info("📦 [TWS-OUT] Despachando {} | Qtd: {} | Lado/Modo: {} | Ref: ${}",
+                    finalDto.symbol(), ibkrOrder.totalQuantity().value(), typeEnum, executionPrice);
 
-            portfolioService.trackOrderSent(finalDto.clientOrderId(), finalDto.symbol(),
+            // Rastreio interno para ajuste de Buying Power local
+            portfolioService.trackOrderSent(
+                    finalDto.clientOrderId(),
+                    finalDto.symbol(),
                     BigDecimal.valueOf(ibkrOrder.totalQuantity().value().doubleValue()),
-                    executionPrice);
+                    executionPrice
+            );
 
-            // Disparo imediato na Ponte
+            // Disparo físico para o Gateway
             connector.placeOrder(String.valueOf(finalOrderId), contract, ibkrOrder);
 
-            // 🛡️ [AJUSTE PASSO 2.1] Bloqueio pós-envio
-            // Tranca o símbolo apenas se for uma ordem de redução/ejeção para evitar reentrada frenética
+            // Trava o ativo se for redução para evitar ordens sobrepostas
             if (isReduction) {
                 orderLockManager.lock(symbol);
             }
@@ -135,9 +159,10 @@ public class OrderService {
 
         } catch (Exception e) {
             log.error("💥 [FATAL-ORDER-FLOW] Falha no despacho de {}: {}", finalDto.symbol(), e.getMessage());
-            throw new RuntimeException("Falha no fluxo de ordem da Ponte", e);
+            throw new RuntimeException("Falha no fluxo de ordem da Ponte: " + e.getMessage(), e);
         }
     }
+
     private OrderDTO handleBracketOrder(OrderDTO masterOrderDto) {
         Contract contract = contractFactory.create(masterOrderDto.symbol());
         int masterId = orderIdManager.getNextOrderId();

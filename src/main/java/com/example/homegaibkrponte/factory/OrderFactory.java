@@ -89,6 +89,32 @@ public class OrderFactory {
 
         return ibkrOrder;
     }
+
+    /**
+     * ✅ MÉTODO DE CRIAÇÃO DIRETA (Simple Create)
+     * Permite criar ordens injetando o preço soberano do Principal.
+     */
+    public Order createSimple(String action, long quantity, BigDecimal referencePrice) {
+        com.ib.client.Order ibkrOrder = new com.ib.client.Order();
+
+        // 1. AÇÃO E QUANTIDADE
+        ibkrOrder.action(action.toUpperCase()); // BUY ou SELL
+        ibkrOrder.totalQuantity(com.ib.client.Decimal.get(quantity));
+
+        // 2. DEFINIÇÃO COMO LIMIT (Soberania de Preço)
+        // Transformamos em LMT para garantir que a IBKR use o preço que enviamos
+        ibkrOrder.orderType(com.ib.client.OrderType.LMT);
+        ibkrOrder.lmtPrice(referencePrice.doubleValue());
+
+        // 3. CONFIGURAÇÕES PADRÃO INSTITUCIONAIS
+        ibkrOrder.tif("GTC");
+        ibkrOrder.outsideRth(true); // Permite operar pré/pós market
+        ibkrOrder.account(connector.getAccountId());
+        ibkrOrder.clearingIntent("IB");
+
+        return ibkrOrder;
+    }
+
     /**
      * ✅ SINERGIA TOTAL: Resolve o conflito de tipagem e mapeia o Enum de INTENÇÃO (Principal)
      * para o tipo IBKR (Ponte/TWS).

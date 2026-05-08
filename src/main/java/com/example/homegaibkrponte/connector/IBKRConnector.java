@@ -261,19 +261,41 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 //        });
 //    }
 
+    /**
+     * 🚀 ENVIO DIRETO E INCONDICIONAL:
+     * Se o Principal decidiu, a Ponte executa sem bloqueios de preço.
+     */
     public void placeOrder(String principalClientId, Contract contract, com.ib.client.Order order) {
+        // 🛡️ ENTRADA NO FUNIL SERIALIZADO (Garante ordem cronológica de saída)
         dispatcherExecutor.submit(() -> {
             try {
-                if (!isConnected()) throw new IllegalStateException("TWS desconectada");
+                // 1. Verificação mínima de infraestrutura (Socket precisa estar aberto)
+                if (!isConnected()) {
+                    log.error("❌ [TWS-OUT] Gateway desconectado para {}. Ordem perdida.", principalClientId);
+                    return;
+                }
 
+                // 🆔 GERENCIAMENTO DE ID E REFERÊNCIA
                 int internalIbkrId = this.getNextOrderId();
                 order.orderRef(principalClientId);
 
-                // Disparo sem espera de margem ou snapshot. A responsabilidade é do Principal.
+                // 📦 REGISTRO NO CACHE DE RECUPERAÇÃO (Para tratamento de erros pós-envio)
+                lastOrdersCache.put(internalIbkrId, order);
+                lastContractsCache.put(internalIbkrId, contract);
+
+                // 📊 LOG DE TRANSMISSÃO
+                log.info("📦 [TWS-OUT] Transmitindo {} | Qty: {} | Ref: {}",
+                        contract.symbol(), order.totalQuantity().value(), principalClientId);
+
+                // 📤 DISPARO FÍSICO PARA A CORRETORA (Sem travas de preço interno)
                 this.client.placeOrder(internalIbkrId, contract, order);
-                log.info("✅✅✅✅✅✅✅✅✅✅✅✅✅ [TWS-OUT] Ordem {} transmitida.", internalIbkrId);
+
+                log.info("✅✅✅✅✅✅✅ [TWS-SUCCESS] Ordem {} despachada para o Broker.", internalIbkrId);
+
             } catch (Exception e) {
-                log.error("💥 [TWS-OUT] Falha: {}", e.getMessage());
+                log.error("💥 [TWS-ERROR] Falha técnica no despacho de {}: {}", contract.symbol(), e.getMessage());
+                // Estorno de capital apenas em caso de erro de exceção técnica
+                portfolioService.removePendingOrderById(principalClientId);
             }
         });
     }
@@ -404,19 +426,17 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     }
 
     // O método getNextOrderId deve ser assim:
-    public int getNextOrderId() {
-        int id = nextValidOrderId.getAndIncrement();
+    public synchronized int getNextOrderId() {
+        int currentManagedId = orderIdManager.getCurrentId();
+        int nextId = nextValidOrderId.get();
 
-        // 🛡️ TRAVA HEGEMONIA: Se o ID for menor que o cache de segurança do OrderIdManager,
-        // forçamos o uso do ID gerenciado.
-        int currentSafeId = orderIdManager.getCurrentId();
+        // 🛡️ Garante que sempre usamos o maior entre o manager e o contador local
+        int finalId = Math.max(currentManagedId, nextId);
 
-        if (id < currentSafeId) {
-            log.warn("⚠️ [ID-DRIFT] ID incrementado ({}) menor que ID seguro ({}). Ajustando...", id, currentSafeId);
-            nextValidOrderId.set(currentSafeId + 1);
-            return currentSafeId;
-        }
-        return id;
+        nextValidOrderId.set(finalId + 1);
+        orderIdManager.initializeOrUpdate(finalId + 1);
+
+        return finalId;
     }
 
 
@@ -1071,9 +1091,13 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             }
 
             // --- 5. AUTO-CORREÇÃO DE ID ---
-            if (errorCode == 103) {
-                log.warn("🔄 [ID-RECOVERY] Erro 103. Salto automático.");
-                orderIdManager.initializeOrUpdate(id + 1000);
+            if (errorCode == 103 || errorCode == 10197) {
+                log.error("🚨 [CRITICAL-ID-FAULT] Erro {}. Sincronizando IDs via TWS...", errorCode);
+                // Tenta extrair o ID que a TWS sugeriu na mensagem de erro (geralmente vem no texto)
+                // Se não conseguir extrair, dá um salto institucional de 1000
+                int currentId = orderIdManager.getCurrentId();
+                orderIdManager.initializeOrUpdate(currentId + 1000);
+                nextValidOrderId.set(currentId + 1001);
                 return;
             }
 

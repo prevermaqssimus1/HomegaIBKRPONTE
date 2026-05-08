@@ -20,11 +20,9 @@ import java.util.Optional;
  * mantendo a robustez do sistema.
  */
 public record OrderDTO(
-        @JsonProperty("symbol") @NotNull(message = "O símbolo (symbol) é obrigatório.") String symbol,
-
-        @JsonProperty("type") @NotNull(message = "O tipo da ordem (type) é obrigatório.") String type,
-
-        @JsonProperty("quantity") @NotNull(message = "A quantidade (quantity) é obrigatória.") BigDecimal quantity,
+        @JsonProperty("symbol") String symbol,
+        @JsonProperty("type") String type, // O Principal enviará "SELL_MARKET" ou "SELL"
+        @JsonProperty("quantity") BigDecimal quantity,
         @JsonProperty("price") BigDecimal price,
         @JsonProperty("orderId") Integer orderId,
         @JsonProperty("stopLossOrderId") String stopLossOrderId,
@@ -34,7 +32,7 @@ public record OrderDTO(
         @JsonProperty("priceRef") BigDecimal priceRef,
         @JsonProperty("limitPrice") BigDecimal limitPrice,
         @JsonProperty("rationale") String rationale,
-        @JsonProperty("clientOrderId") @NotNull(message = "O ID do cliente (clientOrderId) é obrigatório.") String clientOrderId,
+        @JsonProperty("clientOrderId") String clientOrderId,
         @JsonProperty("childOrders") List<OrderDTO> childOrders
 ) {
     private static final Logger log = LoggerFactory.getLogger(OrderDTO.class);
@@ -97,38 +95,29 @@ public record OrderDTO(
 
     // --- MÉTODOS DE LÓGICA E SINERGIA ---
 
-    /**
-     * Converte a String 'type' para o Enum interno com segurança.
-     * @return OrderTypeEnum ou null caso o mapeamento falhe.
-     */
-    /**
-     * ✅ AJUSTE DE SINERGIA: Mapeia Strings genéricas para o OrderTypeEnum.
-     * Resolve o erro 500 ao traduzir "SELL" vindo do Principal para "SELL_MARKET".
-     */
     public com.example.homegaibkrponte.model.OrderTypeEnum getTypeAsEnum() {
         try {
             if (this.type == null) return null;
-
             String normalizedType = this.type.toUpperCase().trim();
 
-            // 🛡️ TRADUTOR DE EMERGÊNCIA:
-            // Se o Principal enviar apenas "SELL", mapeamos para SELL_MARKET
-            // para garantir que a AMD seja vendida agora e salve a margem.
-            if (normalizedType.equals("SELL")) {
-                log.warn("⚠️ [SINERGIA] Traduzindo String 'SELL' para Enum SELL_MARKET.");
-                return com.example.homegaibkrponte.model.OrderTypeEnum.SELL_MARKET;
-            }
+            return switch (normalizedType) {
+                // ☢️ TRADUTOR DE EMERGÊNCIA (O aperto de mão que salvamos a conta)
+                // Quando o Principal manda apenas a ação, a Ponte assume a execução a Mercado.
+                case "BUY" -> com.example.homegaibkrponte.model.OrderTypeEnum.BUY_MARKET;
+                case "SELL" -> com.example.homegaibkrponte.model.OrderTypeEnum.SELL_MARKET;
 
-            if (normalizedType.equals("BUY")) {
-                log.warn("⚠️ [SINERGIA] Traduzindo String 'BUY' para Enum BUY_MARKET.");
-                return com.example.homegaibkrponte.model.OrderTypeEnum.BUY_MARKET;
-            }
+                // 🎯 MAPEAMENTO DE ALIASES EXPLÍCITOS
+                case "MKT", "MARKET" -> com.example.homegaibkrponte.model.OrderTypeEnum.MKT;
+                case "LMT", "LIMIT"  -> com.example.homegaibkrponte.model.OrderTypeEnum.LMT;
 
-            // Tenta o mapeamento padrão (Ex: "SELL_STOP_LOSS")
-            return com.example.homegaibkrponte.model.OrderTypeEnum.valueOf(normalizedType.replace(" ", "_"));
-
+                // ⚖️ TRATAMENTO PADRÃO (Para Enums complexos como SELL_STOP_LOSS)
+                default -> com.example.homegaibkrponte.model.OrderTypeEnum.valueOf(normalizedType.replace(" ", "_"));
+            };
         } catch (IllegalArgumentException e) {
-            log.error("❌ [SINERGIA] Falha fatal ao reconhecer tipo: {}. Ordem abortada.", this.type);
+            log.error("❌ [PONTE-ERRO] Tipo de ordem desconhecido: {}. Verifique a sinergia Principal/Ponte.", this.type);
+            return null;
+        } catch (Exception e) {
+            log.error("❌ [PONTE-FATAL] Falha na conversão de tipo: {}", e.getMessage());
             return null;
         }
     }

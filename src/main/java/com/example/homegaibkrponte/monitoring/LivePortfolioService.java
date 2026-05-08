@@ -148,6 +148,48 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         // através do método getBridgeHealth() que você já possui.
     }
 
+    /**
+     * 🛡️ [LEITURA DE ÚLTIMA INSTÂNCIA] Recupera o último preço conhecido para um ticker.
+     * Sinergia: Crucial para evitar o envio de ordens com preço $0 quando o Oráculo
+     * solicita uma reserva de capital e a Ponte está em warmup ou sem ticks.
+     */
+    public BigDecimal getLastKnownPrice(String symbol) {
+        if (symbol == null || symbol.isBlank()) return BigDecimal.ZERO;
+        String sym = symbol.toUpperCase();
+
+        // 1. ⚡ CAMADA 1: Preço em Tempo Real (Rádio/Streaming)
+        // A chave "_PRICE" é alimentada pelo fluxo contínuo de ticks do Finnhub/TWS.
+        BigDecimal realTimePrice = accountValuesCache.get(sym + "_PRICE");
+        if (realTimePrice != null && realTimePrice.signum() > 0) {
+            return realTimePrice;
+        }
+
+        // 2. 🔍 CAMADA 2: Preço de Inventário (Custódia/Average Price)
+        // Se temos o ativo em carteira, o preço médio é uma base segura para precificação.
+        BigDecimal inventoryPrice = getPositionAveragePrice(sym);
+        if (inventoryPrice.signum() > 0) {
+            log.info("🛡️ [PRICE-RECOVERY] Usando preço de inventário para {}: ${}", sym, inventoryPrice);
+            return inventoryPrice;
+        }
+
+        // 3. 🩹 CAMADA 3: Rastreio Histórico (GHOST PRICE)
+        // Varre o cache por qualquer valor associado ao símbolo (snapshots anteriores).
+        BigDecimal lastAnyPrice = accountValuesCache.entrySet().stream()
+                .filter(e -> e.getKey().startsWith(sym))
+                .map(Map.Entry::getValue)
+                .filter(v -> v != null && v.signum() > 0)
+                .findFirst()
+                .orElse(BigDecimal.ZERO);
+
+        if (lastAnyPrice.signum() > 0) {
+            log.warn("🩹 [GHOST-PRICE] Preço de {} recuperado do rastro histórico: ${}", sym, lastAnyPrice);
+            return lastAnyPrice;
+        }
+
+        log.error("❌ [DADO-FATAL] Falha total na precificação de {}. Abortando ciclo.", sym);
+        return BigDecimal.ZERO;
+    }
+
 
 //    /**
 //     * 🛡️ MÉTODO ÚLTIMA ESPERANÇA (Sinergia de Dados)

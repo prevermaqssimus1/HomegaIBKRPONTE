@@ -1055,34 +1055,36 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     @Override
     public void position(String account, Contract contract, Decimal pos, double avgCost) {
         try {
-            String ticker = contract.symbol();
+            String rawTicker = contract.symbol();
 
-            if (ticker == null || ticker.isBlank()) {
+            if (rawTicker == null || rawTicker.isBlank()) {
                 log.warn("Símbolo principal (symbol) não encontrado para conId={}. Tentando usar o símbolo local (localSymbol)...", contract.conid());
-                ticker = contract.localSymbol();
+                rawTicker = contract.localSymbol();
             }
 
-            if (ticker == null || ticker.isBlank()) {
+            if (rawTicker == null || rawTicker.isBlank()) {
                 log.error("ERRO CRÍTICO DE SINCRONIZAÇÃO: Não foi possível determinar o ticker para a posição. conId={}, secType={}. Esta posição será ignorada.",
                         contract.conid(), contract.secType());
                 return;
             }
 
+            // 🎯 SOLUÇÃO PARA O LAMBDA: Criamos uma variável final imutável
+            final String tickerFinal = rawTicker.trim();
+
             // 🛡️ PROTOCOLO ANTI-POEIRA V22.5 (CRÍTICO)
-            // Ignora valores como 0E-16 ou posições residuais menores que 0.01.
-            // Isso impede o loop infinito de sincronização que trava o despacho de ordens reais.
             BigDecimal quantity = (pos != null) ? pos.value() : BigDecimal.ZERO;
 
             if (quantity.abs().compareTo(new BigDecimal("0.01")) < 0) {
-                // Logamos apenas em DEBUG para não poluir, mas ignoramos o processamento
-//                log.debug("🧹 [FILTRO-PONTE] Poeira detectada em {}: {}. Ignorando sincronia.", ticker, quantity.toPlainString());
                 return;
             }
 
-            log.info("🎯 [PONTE-SINCRONIA] Posição REAL ativa: {} {} @ {}", quantity, ticker, avgCost);
+            // 🚀 AJUSTE DE HIGIENE: Usando a variável final para evitar o erro de compilação
+            tempPositions.removeIf(p -> p.getTicker().equalsIgnoreCase(tickerFinal));
+
+            log.info("🎯 [PONTE-SINCRONIA] Posição REAL ativa: {} {} @ {}", quantity, tickerFinal, avgCost);
 
             PositionDTO positionDto = new PositionDTO();
-            positionDto.setTicker(ticker.trim());
+            positionDto.setTicker(tickerFinal);
             positionDto.setPosition(quantity);
             positionDto.setMktPrice(BigDecimal.valueOf(avgCost));
 
@@ -1092,7 +1094,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             log.error("💥 [PONTE | POSIÇÃO] Erro ao processar a posição para contrato {}. Rastreando.", contract.conid(), e);
         }
     }
-
     @Override
     public void positionEnd() {
         try {
@@ -1104,7 +1105,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
             // 2. LIMPEZA DE RASTRO: Agora que o cache oficial está atualizado,
             // podemos resetar as memórias temporárias (Sombra e Buffer).
-            // Isso elimina qualquer "drift" (desvio) acumulado durante o caos da execução.
             shadowPositions.clear();
             tempPositions.clear();
 
@@ -1117,7 +1117,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             log.error("💥 [PONTE | POSIÇÃO END] Falha CRÍTICA na consolidação do inventário: {}", e.getMessage());
         }
     }
-
 
     @Override
     public void updateAccountValue(String key, String value, String currency, String accountName) {

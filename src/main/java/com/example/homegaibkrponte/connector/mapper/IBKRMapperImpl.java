@@ -11,8 +11,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.util.Optional;
+import java.util.ArrayList;
+import java.util.List;
 
 @Component
 @Slf4j
@@ -22,71 +22,89 @@ public class IBKRMapperImpl implements IBKRMapper {
     private final OrderIdManager orderIdManager;
 
     @Override
-    public Contract toContract(Order domainOrder) {
-        return toContract(domainOrder.symbol());
-    }
-
-    /**
-     * ✅ AJUSTE MUNDIAL: Mapeamento de Contrato para evitar Erro 200.
-     * Segue as diretrizes da IBKR para roteamento internacional.
-     */
-    @Override
     public Contract toContract(String symbol) {
         Contract contract = new Contract();
-
-        // 1. Identificação do sufixo (Ex: 6501.T, 7203.T, SAP.DE)
         String cleanSymbol = symbol.contains(".") ? symbol.split("\\.")[0] : symbol;
         contract.symbol(cleanSymbol);
         contract.secType("STK");
-
-        // 🎌 ROTEAMENTO JAPÃO (.T)
-        if (symbol.endsWith(".T")) {
-            contract.currency("JPY");
-            contract.exchange("TSE");        // Ajustado de TSEJ para TSE (Padrão mais aceito)
-            contract.primaryExch("TSE");     // Necessário para desambiguação
-            log.warn("🎌 [INFRA-IBKR] Roteamento Japão: {} -> TSE/JPY", cleanSymbol);
-        }
-        // 🇪🇺 ROTEAMENTO EUROPA (Ex: .DE - Alemanha, .PA - França)
-        else if (symbol.contains(".")) {
-            String suffix = symbol.substring(symbol.lastIndexOf(".") + 1).toUpperCase();
-            contract.currency("EUR");
-
-            if (suffix.equals("DE")) {
-                contract.exchange("IBIS");   // Xetra/Alemanha
-                contract.primaryExch("IBIS");
-            } else {
-                contract.exchange("SMART");
-            }
-            log.warn("🇪🇺 [INFRA-IBKR] Roteamento Europa: {} -> SMART/EUR", cleanSymbol);
-        }
-        // 🇺🇸 ROTEAMENTO EUA (Padrão)
-        else {
-            contract.currency("USD");
-            contract.exchange("SMART");
-            log.info("🇺🇸 [INFRA-IBKR] Roteamento EUA: {} -> SMART/USD", symbol);
-        }
-
+        contract.currency("USD");
+        contract.exchange("SMART");
         return contract;
+    }
+
+    @Override
+    public Contract toContract(Order domainOrder) {
+        return toContract(domainOrder.symbol());
     }
 
     @Override
     public com.ib.client.Order toIBKROrder(Order domainOrder) {
         com.ib.client.Order ibkrOrder = new com.ib.client.Order();
-        int orderId = orderIdManager.getNextOrderId();
-        ibkrOrder.orderId(orderId);
-        ibkrOrder.clientId(orderIdManager.getClientId());
+
+        // Configurações Base
+        ibkrOrder.action(domainOrder.quantity().signum() > 0 ? "BUY" : "SELL");
+        ibkrOrder.totalQuantity(Decimal.get(domainOrder.quantity().abs()));
         ibkrOrder.account(orderIdManager.getAccountId());
 
-        if (domainOrder.quantity().compareTo(BigDecimal.ZERO) > 0) {
-            ibkrOrder.action("BUY");
+        // 🎯 AJUSTE: Usando .price() que é o campo real do seu domainOrder
+        if (domainOrder.type() != null) {
+            ibkrOrder.orderType(domainOrder.type().name());
+            if ("LMT".equals(domainOrder.type().name()) && domainOrder.price() != null) {
+                ibkrOrder.lmtPrice(domainOrder.price().doubleValue());
+            }
         } else {
-            ibkrOrder.action("SELL");
+            ibkrOrder.orderType("MKT");
         }
 
-        ibkrOrder.totalQuantity(Decimal.get(domainOrder.quantity().abs()));
-        mapOrderTypeAndPrices(domainOrder, ibkrOrder);
-
         return ibkrOrder;
+    }
+
+    @Override
+    public List<com.ib.client.Order> toBracketOrder(Order domainOrder) {
+        List<com.ib.client.Order> bracket = new ArrayList<>();
+
+        // 1. ORDEM PAI (Entrada)
+        com.ib.client.Order parent = toIBKROrder(domainOrder);
+        parent.orderId(orderIdManager.getNextOrderId());
+        parent.transmit(false);
+        bracket.add(parent);
+
+        String exitAction = parent.getAction().equals("BUY") ? "SELL" : "BUY";
+
+        // 2. FILHA: STOP LOSS (Contingência)
+        if (domainOrder.stopLossPrice() != null && domainOrder.stopLossPrice().signum() > 0) {
+            com.ib.client.Order stopLoss = new com.ib.client.Order();
+            stopLoss.orderId(orderIdManager.getNextOrderId());
+            stopLoss.parentId(parent.orderId());
+            stopLoss.action(exitAction);
+            stopLoss.orderType("STP");
+            stopLoss.auxPrice(domainOrder.stopLossPrice().doubleValue());
+            stopLoss.totalQuantity(parent.totalQuantity());
+            stopLoss.transmit(false);
+            bracket.add(stopLoss);
+        }
+
+        // 3. FILHA: TAKE PROFIT
+        if (domainOrder.takeProfitPrice() != null && domainOrder.takeProfitPrice().signum() > 0) {
+            com.ib.client.Order takeProfit = new com.ib.client.Order();
+            takeProfit.orderId(orderIdManager.getNextOrderId());
+            takeProfit.parentId(parent.orderId());
+            takeProfit.action(exitAction);
+            takeProfit.orderType("LMT");
+            // 🎯 AJUSTE: Aqui usamos o takeProfitPrice do domínio
+            takeProfit.lmtPrice(domainOrder.takeProfitPrice().doubleValue());
+            takeProfit.totalQuantity(parent.totalQuantity());
+            takeProfit.transmit(true);
+            bracket.add(takeProfit);
+        } else {
+            if (bracket.size() > 1) {
+                bracket.get(bracket.size() - 1).transmit(true);
+            } else {
+                parent.transmit(true);
+            }
+        }
+
+        return bracket;
     }
 
     @Override
@@ -95,7 +113,7 @@ public class IBKRMapperImpl implements IBKRMapper {
         ibkrOrder.orderId(orderId);
         ibkrOrder.action(side);
         ibkrOrder.totalQuantity(Decimal.get(Long.valueOf(quantity)));
-        ibkrOrder.orderType(com.ib.client.OrderType.MKT.name());
+        ibkrOrder.orderType("MKT");
         ibkrOrder.whatIf(true);
         ibkrOrder.transmit(false);
         return ibkrOrder;
@@ -113,34 +131,9 @@ public class IBKRMapperImpl implements IBKRMapper {
 
     @Override
     public BigDecimal parseMarginValue(String marginValue) {
-        if (marginValue == null || marginValue.isEmpty() || marginValue.equalsIgnoreCase("N/A")) {
-            return BigDecimal.ZERO;
-        }
+        if (marginValue == null || marginValue.isEmpty()) return BigDecimal.ZERO;
         try {
-            String cleanedValue = marginValue.replaceAll("[^0-9\\.\\-]", "");
-            if (cleanedValue.contains("E308") || cleanedValue.contains("E+308")) return BigDecimal.ZERO;
-            return new BigDecimal(cleanedValue);
-        } catch (NumberFormatException e) {
-            return BigDecimal.ZERO;
-        }
-    }
-
-    private void mapOrderTypeAndPrices(Order domainOrder, com.ib.client.Order ibkrOrder) {
-        BigDecimal price = Optional.ofNullable(domainOrder.price())
-                .orElse(BigDecimal.ZERO)
-                .setScale(2, RoundingMode.HALF_UP);
-
-        switch (domainOrder.type()) {
-            case MKT -> ibkrOrder.orderType(com.ib.client.OrderType.MKT.name());
-            case LMT -> {
-                ibkrOrder.orderType(com.ib.client.OrderType.LMT.name());
-                ibkrOrder.lmtPrice(price.doubleValue());
-            }
-            case STP -> {
-                ibkrOrder.orderType(com.ib.client.OrderType.STP.name());
-                ibkrOrder.auxPrice(price.doubleValue());
-            }
-            default -> ibkrOrder.orderType(com.ib.client.OrderType.MKT.name());
-        }
+            return new BigDecimal(marginValue.replaceAll("[^0-9\\.\\-]", ""));
+        } catch (Exception e) { return BigDecimal.ZERO; }
     }
 }

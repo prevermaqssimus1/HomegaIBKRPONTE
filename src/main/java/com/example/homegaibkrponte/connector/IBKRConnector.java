@@ -83,6 +83,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     private final CountDownLatch connectionLatch = new CountDownLatch(1);
     private static final int CRITICAL_MARGIN_REQ_ID = 9001;
     private final Map<String, Integer> recoveryAttempts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, BigDecimal> shadowPositions = new ConcurrentHashMap<>();
     // ✅ CAMPO SINÉRGICO: Listener de Callback para o Principal
     private Optional<BPSyncedListener> bpListener = Optional.empty();
     private Set<String> symbolsBoughtToday = Collections.synchronizedSet(new HashSet<>());
@@ -262,43 +263,87 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 //    }
 
     /**
-     * 🚀 ENVIO DIRETO E INCONDICIONAL:
-     * Se o Principal decidiu, a Ponte executa sem bloqueios de preço.
+     * 🚀 DESPACHO BLINDADO V28.0 (PROTOCOLO HEGEMONIA + SHADOW MEMORY)
+     * Mantém a estrutura de logs original e adiciona consciência instantânea de inventário.
      */
     public void placeOrder(String principalClientId, Contract contract, com.ib.client.Order order) {
-        // 🛡️ ENTRADA NO FUNIL SERIALIZADO (Garante ordem cronológica de saída)
         dispatcherExecutor.submit(() -> {
             try {
-                // 1. Verificação mínima de infraestrutura (Socket precisa estar aberto)
-                if (!isConnected()) {
-                    log.error("❌ [TWS-OUT] Gateway desconectado para {}. Ordem perdida.", principalClientId);
+                if (!client.isConnected()) {
+                    log.error("❌ [TWS-OFFLINE] Tentativa de ordem negada: Cliente desconectado.");
                     return;
                 }
 
-                // 🆔 GERENCIAMENTO DE ID E REFERÊNCIA
+                // 📡 LOG DE ENTRADA TÁTICA (Radar Primário)
+                log.info("📥 [DESPACHO-IN] Recebido do Principal: Ref: {} | Ativo: {} | Lado Original: {} | Qtd: {}",
+                        principalClientId, contract.symbol(), order.getAction(), order.totalQuantity().value());
+
                 int internalIbkrId = this.getNextOrderId();
+                String symbol = contract.symbol();
+
+                // 1. Definição expandida de fechamento
+                boolean isClosingOrder = principalClientId.contains("CLOSE")
+                        || principalClientId.contains("EXIT")
+                        || principalClientId.contains("EJECT")
+                        || principalClientId.contains("KILL");
+
+                // --- 🛡️ VALIDAÇÃO DUPLA (PROTOCOLO HEGEMONIA + BLINDAGEM DE LATÊNCIA) ---
+
+                // A. Busca a última verdade oficial reportada pela TWS (Buffer/Cache)
+                BigDecimal posicaoDaTWS = this.tempPositions.stream()
+                        .filter(p -> p.getTicker().equalsIgnoreCase(symbol))
+                        .map(PositionDTO::getPosition)
+                        .findFirst()
+                        .orElse(portfolioService.getPositionForSymbol(symbol));
+
+                // B. Cruza com a Memória Sombreada (Shadow) para neutralizar o delay da corretora
+                // Se houver registro na sombra (execução recente), ela é a verdade absoluta.
+                BigDecimal posicaoReal = shadowPositions.getOrDefault(symbol, posicaoDaTWS);
+
+                // Log de Inquisição para Auditoria de Sincronia
+                log.info("🔍 [INQUISIÇÃO] {} | TWS diz: {} | Shadow diz: {} | Final: {}",
+                        symbol, posicaoDaTWS, shadowPositions.get(symbol), posicaoReal);
+
+                if (isClosingOrder) {
+                    // 🛡️ VETO ABSOLUTO (MATA-ECO): Se a posição real (Shadow/TWS) for ZERO, aborta.
+                    if (posicaoReal.signum() == 0) {
+                        log.error("🛑 ⛔⛔[VETO-SEGURANÇA] Abortado! Ordem {} negada para {}: Custódia já está ZERADA (Shadow/TWS). Impedindo abertura de mão trocada.",
+                                principalClientId, symbol);
+                        return; // ⛔ COMANDO CRÍTICO: Mata a execução do dispatcher aqui.
+                    }
+
+                    // 2️⃣ Validação de Lado (Double-Check de Sinal)
+                    if (posicaoReal.signum() < 0) { // 🔴 SHORT real
+                        if (!"BUY".equals(order.getAction())) {
+                            log.warn("🔄 [REPARAÇÃO-SHORT] Conflito em {}. Posição Real é SHORT ({}). Forçando BUY físico.", symbol, posicaoReal);
+                            order.action("BUY");
+                        }
+                    }
+                    else if (posicaoReal.signum() > 0) { // 🟢 LONG real
+                        if (!"SELL".equals(order.getAction())) {
+                            log.warn("🔄 [REPARAÇÃO-LONG] Conflito em {}. Posição Real é LONG ({}). Forçando SELL físico.", symbol, posicaoReal);
+                            order.action("SELL");
+                        }
+                    }
+                }
+
+                // 4. ENVIO FÍSICO
                 order.orderRef(principalClientId);
+                log.info("📡 [TWS-OUT] Despachando {} | Lado Final: {} | Qtd: {} | Ref: {}",
+                        symbol, order.getAction(), order.totalQuantity().value(), principalClientId);
 
-                // 📦 REGISTRO NO CACHE DE RECUPERAÇÃO (Para tratamento de erros pós-envio)
-                lastOrdersCache.put(internalIbkrId, order);
-                lastContractsCache.put(internalIbkrId, contract);
-
-                // 📊 LOG DE TRANSMISSÃO
-                log.info("📦 [TWS-OUT] Transmitindo {} | Qty: {} | Ref: {}",
-                        contract.symbol(), order.totalQuantity().value(), principalClientId);
-
-                // 📤 DISPARO FÍSICO PARA A CORRETORA (Sem travas de preço interno)
                 this.client.placeOrder(internalIbkrId, contract, order);
 
-                log.info("✅✅✅✅✅✅✅ [TWS-SUCCESS] Ordem {} despachada para o Broker.", internalIbkrId);
+                // ⏱️ Cadência Técnica Institucional
+                TimeUnit.MILLISECONDS.sleep(20);
 
             } catch (Exception e) {
-                log.error("💥 [TWS-ERROR] Falha técnica no despacho de {}: {}", contract.symbol(), e.getMessage());
-                // Estorno de capital apenas em caso de erro de exceção técnica
-                portfolioService.removePendingOrderById(principalClientId);
+                log.error("💥 [TWS-ERROR] Falha no despacho de {}: {}", contract.symbol(), e.getMessage());
             }
         });
     }
+
+
 
 //    public BigDecimal requestImmediatePriceSnapshot(String symbol) {
 //        // 1. Verificação de Sanidade da Conexão
@@ -361,69 +406,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 //        }
 //    }
 
-    /**
-     * 🔄 PROTOCOLO DE RECUPERAÇÃO EXAUSTIVO (Ajustado para Sustentabilidade)
-     * Implementa CIRCUIT BREAKER para evitar loops infinitos de rejeição 201.
-     */
-    private void tentarReenvioComReducao(int originalId, com.ib.client.Contract contract, com.ib.client.Order order) {
-        String symbol = contract.symbol();
-        try {
-            // 🛡️ COOLDOWN: Tempo para o TWS limpar a rejeição anterior
-            Thread.sleep(1500);
-
-            int falhas = symbolFailureCounter.getOrDefault(symbol, 0) + 1;
-            symbolFailureCounter.put(symbol, falhas);
-
-            double qtdAtual = order.totalQuantity().value().doubleValue();
-
-            // 🛑 LÓGICA DE CIRCUIT BREAKER:
-            // Se já falhou mais de 5 vezes ou se a última tentativa já foi o lote mínimo (1.0)
-            if (qtdAtual <= 1.0 || falhas > 6) {
-                log.error("🛑 [CIRCUIT BREAKER] Rejeição persistente em {}. Falhas: {}. Qtd Final: {}. Interrompendo mitigação para preservar banda.",
-                        symbol, falhas, qtdAtual);
-
-                // Notifica o Principal via Webhook para ele saber que o ativo está "travado" por margem
-                webhookNotifier.sendOrderRejection(originalId, 201, "CIRCUIT BREAKER: Margem exausta mesmo no lote mínimo para " + symbol);
-
-                // Limpeza de estado para permitir que o sistema tente de novo apenas se o Oráculo mandar uma nova ordem no futuro
-                symbolFailureCounter.remove(symbol);
-                return;
-            }
-
-            double novaQtd;
-
-            if (falhas == 1) {
-                novaQtd = Math.floor(qtdAtual * 0.30); // Tenta apenas 30% do lote original
-            } else {
-                novaQtd = Math.floor(qtdAtual * 0.50); // Reduções subsequentes
-            }
-            if (falhas > 3) {
-                // 🚨 FASE DE EMERGÊNCIA: Fragmentação agressiva
-                novaQtd = (qtdAtual > 10) ? Math.floor(qtdAtual * 0.3) : 1.0;
-                log.error("🚨 [ABORDAGEM DE EMERGÊNCIA] Tentando fragmentação granular para {}. Qtd: {}", symbol, novaQtd);
-            } else {
-                // 🔄 FASE PADRÃO: Redução de 40% (Step-Down)
-                novaQtd = Math.floor(qtdAtual * 0.60);
-                if (novaQtd < 1) novaQtd = 1.0;
-                log.warn("🔄 [RECOVERY SMART] Tentativa {} para {}. Ajustando lote: {} -> {}", falhas, symbol, qtdAtual, novaQtd);
-            }
-
-            // EXECUÇÃO DO REENVIO
-            order.totalQuantity(com.ib.client.Decimal.get(novaQtd));
-            order.orderType("MKT"); // Força Market para garantir tentativa de execução imediata
-            order.lmtPrice(0);
-
-            int novoId = orderIdManager.getNextOrderId();
-            log.info("📤 [RECOVERY ENVIO] Submetendo mitigação reduzida de {} (ID: {})", symbol, novoId);
-            this.placeOrder(String.valueOf(novoId), contract, order);
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.error("❌ [RECOVERY] Thread interrompida.");
-        } catch (Exception e) {
-            log.error("💥 [RECOVERY] Erro crítico no protocolo de emergência para {}: {}", symbol, e.getMessage());
-        }
-    }
 
     // O método getNextOrderId deve ser assim:
     public synchronized int getNextOrderId() {
@@ -452,104 +434,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         return this.symbolFailureCounter.getOrDefault(symbol, 0);
     }
 
-    /**
-     * ✅ ETAPA 1: Ativa a "torneira" de dados.
-     * Chame este método uma única vez após a conexão ser estabelecida.
-     */
-//    public void startStreaming() {
-//        String accId = this.getAccountId(); // Ou a variável que guarda seu DUN...
-//        if (this.getClient() != null && isConnected()) {
-//            log.info("🚀 [PONTE | STREAMING] Ativando subscrição contínua para conta: {}", accId);
-//
-//            // 'true' mantém a subscrição aberta. A TWS enviará dados sempre que houver mudança.
-//            this.getClient().reqAccountUpdates(true, accId);
-//        } else {
-//            log.error("❌ [PONTE] Falha ao iniciar streaming: Cliente não conectado.");
-//        }
-//    }
-
-
-
-
-
-
-
-
-
-
-//    /**
-//     * Realiza uma simulação preventiva de margem antes do envio real.
-//     */
-//    public boolean validarMargemPreventiva(Contract contract, Order order) {
-//        int reqId = order.orderId();
-//        try {
-//            log.info("🔍 [PRE-CHECK] Iniciando simulação What-If para {} (ID: {})", contract.symbol(), reqId);
-//
-//            order.whatIf(true);
-//            CompletableFuture<OrderStateDTO> future = new CompletableFuture<>();
-//            whatIfFutures.put(reqId, future);
-//
-//            client.placeOrder(reqId, contract, order);
-//
-//            // Aguarda a resposta (3 segundos de timeout para sinergia)
-//            OrderStateDTO res = future.get(3, TimeUnit.SECONDS);
-//
-//            if (res != null) {
-//                // 📊 LOG DE COMPROVAÇÃO TÉCNICA (Usando seus campos de 'Change' e 'After')
-//                log.info("📊 [WHAT-IF TELEMETRIA] Ativo: {} | Mudança Margem Inicial: {} | EL Projetado (After): {}",
-//                        contract.symbol(), res.getInitMarginChange(), res.getExcessLiquidityAfter());
-//
-//                // A lógica de decisão baseada no seu campo excessLiquidityAfter
-//                double elProjetado = Double.parseDouble(res.getExcessLiquidityAfter());
-//
-//                if (elProjetado <= 0) {
-//                    log.warn("⚠️ [VETO PREVENTIVO] Simulação REPROVADA. EL projetado de {} é insuficiente.", elProjetado);
-//                    return false;
-//                }
-//
-//                log.info("✅ [APROVAÇÃO PREVENTIVA] Margem validada. Prosseguindo com envio real.");
-//                return true;
-//            }
-//            return false;
-//        } catch (Exception e) {
-//            log.error("❌ [WHAT-IF FALHA] Erro ao processar telemetria para {}: {}", contract.symbol(), e.getMessage());
-//            return false;
-//        } finally {
-//            order.whatIf(false);
-//            whatIfFutures.remove(reqId);
-//        }
-//    }
-//
-//
-
-
-
-
-
-
-
-
-//    public void enviarOrdemComPrevecao(com.example.homegaibkrponte.model.Order ordemPrincipal) {
-//        try {
-//            com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
-//            com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
-//
-//            // 1. Tenta validar antes de enviar
-//            boolean margemOk = validarMargemPreventiva(contract, ibkrOrder);
-//
-//            if (margemOk) {
-//                // 2. Se OK, envia a ordem real
-//                this.placeOrder(String.valueOf(ibkrOrder.orderId()), contract, ibkrOrder);
-//            } else {
-//                // 3. Se falhar, chama a nossa lógica de redução (Fase 1) antes mesmo da rejeição 201 ocorrer
-//                log.warn("🔄 [PREVENÇÃO] Margem insuficiente no What-If. Iniciando redução preventiva...");
-//                tentarReenvioComReducao(ibkrOrder.orderId(), contract, ibkrOrder);
-//            }
-//
-//        } catch (Exception e) {
-//            log.error("❌ Erro no fluxo de envio preventivo: ", e);
-//        }
-//    }
 
 
     @Override
@@ -691,71 +575,6 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         socketToUse.reqAccountSummary(CRITICAL_MARGIN_REQ_ID, group, tags);
 
         log.info("📊 [DUAL-CHANNEL] Margem solicitada via CANAL 116 (Gestão). ReqID: {}.", CRITICAL_MARGIN_REQ_ID);
-    }
-
-    public void enviarOrdem(com.example.homegaibkrponte.model.Order ordemPrincipal) throws MarginRejectionException, OrdemFalhouException {
-        try {
-            // 🛡️ [PASSO 1] SINERGIA DE SEGURANÇA: Bloqueio de Short Acidental
-            if (ordemPrincipal.isVenda()) {
-                String symbol = ordemPrincipal.symbol().toUpperCase();
-
-                // 🔬 Consulta ao Snapshot Real da conta para validar estoque físico
-                BigDecimal qtdReal = portfolioService.getAccountValuesCache()
-                        .getOrDefault("POSITION_" + symbol, BigDecimal.ZERO);
-
-                if (qtdReal.signum() <= 0) {
-                    log.error("🚫 [VETO-SEGURANÇA] Abortando venda de {}. Estoque real no Broker é {}! Risco de Short evitado.", symbol, qtdReal);
-                    return;
-                }
-
-                // 🧹 [PASSO 2] LIMPEZA DE VIA: Cancela ordens pendentes/inativas para liberar BP
-                // Ajustado para a nova assinatura do SDK (exige objeto OrderCancel)
-                log.warn("🧹 [LIMPEZA-PREVENTIVA] {} em saída. Resetando book de ordens para liberar Margem de Ejeção.", symbol);
-
-                OrderCancel oc = new OrderCancel(); // Criamos o objeto de cancelamento exigido pelo seu SDK
-                client.reqGlobalCancel(oc);
-
-                Thread.sleep(300); // ⏳ Pausa técnica para o Gateway IBKR processar a limpeza
-            }
-
-            // 🗺️ [PASSO 3] MAPEAMENTO: Conversão para objetos nativos IBKR
-            com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
-            com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
-
-            int orderId = ibkrOrder.orderId();
-
-            log.info("➡️➡️➡️ [PONTE | TWS-OUT] Enviando Ordem #{} | {} | {} | {} ",
-                    orderId, ibkrOrder.action(), contract.symbol(), ibkrOrder.orderType());
-
-            // 🚀 [PASSO 4] DISPARO: Envio físico para o socket e registro no cache de recuperação
-            this.placeOrder(String.valueOf(orderId), contract, ibkrOrder);
-
-        } catch (Exception e) {
-            String errorMessage = e.getMessage();
-
-            // 🛑 [PASSO 5] GESTÃO DE ERRO 201: Tratamento estratégico de estrangulamento de Margem
-            if (errorMessage != null && (errorMessage.contains("201") || errorMessage.contains("10243"))) {
-
-                if (ordemPrincipal.isVenda()) {
-                    log.warn("🚨 [VETO-MARGEM] Venda de {} rejeitada por BP insuficiente. Ativando Protocolo de Fragmentação...", ordemPrincipal.symbol());
-
-                    try {
-                        com.ib.client.Order ibkrOrder = ibkrMapper.toIBKROrder(ordemPrincipal);
-                        com.ib.client.Contract contract = ibkrMapper.toContract(ordemPrincipal);
-
-                        // 🔄 Tenta o reenvio fatiado (Step-Down) para furar o bloqueio de margem inicial
-                        tentarReenvioComReducao(ibkrOrder.orderId(), contract, ibkrOrder);
-                        return;
-                    } catch (Exception ex) {
-                        log.error("💥 [ERRO-FATAL-RECOVERY] Falha ao iniciar mitigação: {}", ex.getMessage());
-                    }
-                }
-                throw new MarginRejectionException("Erro 201: Margem insuficiente para abrir nova posição.", e);
-            }
-
-            log.error("🛑🛑🛑 [PONTE | ERRO GERAL] Falha catastrófica na ordem {}. Detalhe: {}", ordemPrincipal.symbol(), errorMessage, e);
-            throw new OrdemFalhouException("Falha na execução da ordem na Ponte IBKR.", e);
-        }
     }
 
 
@@ -1002,7 +821,20 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     public void execDetails(int reqId, Contract contract, Execution execution) {
         // Bloco try-catch obrigatório para rastrear falhas na execução [cite: 2025-10-18]
         try {
-            // Logs de rastreamento do TWS-IN
+
+            String symbol = contract.symbol();
+
+            // 🧠 [SHADOW-MEMORY] Atualização instantânea de inventário
+            // BOT = Compra (+), SLD = Venda (-)
+            BigDecimal sideSign = execution.side().equalsIgnoreCase("BOT") ? BigDecimal.ONE : BigDecimal.valueOf(-1);
+            BigDecimal qtyExecutada = BigDecimal.valueOf(execution.shares().longValue()).multiply(sideSign);
+
+            // Merge soma a execução nova à sombra existente
+            shadowPositions.merge(symbol, qtyExecutada, BigDecimal::add);
+
+            log.info("🧠 [SHADOW-UPDATE] {} | Delta: {} | Posição Estimada: {}",
+                    symbol, qtyExecutada, shadowPositions.get(symbol));
+
             log.info("💸 [PONTE | TWS-IN | EXECUÇÃO] Ordem IBKR {} EXECUTADA. Ação: {} {} {} @ {}. Exec ID: {}",
                     execution.orderId(), execution.side(), execution.shares().longValue(), contract.symbol(), execution.price(), execution.execId());
 
@@ -1103,28 +935,22 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
 
             // --- 6. TRATAMENTO DE REJEIÇÃO POR MARGEM (MITIGAÇÃO DIEGO) ---
             if (errorCode == 201 || errorCode == 10243) {
-                log.error("🛑🚨 [MARGEM-ERRO-201] Rejeição definitiva no ID {}. Iniciando Auto-Higiene e mitigação.", id);
+                log.error("🛑🚨 [MARGEM-ERRO-201] Rejeição no ID {}. Iniciando LIQUIDAÇÃO TÁTICA para destravar margem.", id);
 
-                // 1. 🚀 HIGIENE IMEDIATA (Limpa o rastro no Principal para resetar o Buying Power)
+                // 1. HIGIENE IMEDIATA (Libera o Buying Power no Principal)
                 String clientOrderId = orderIdManager.getClientOrderId(id);
-                if (clientOrderId != null && !clientOrderId.equals("0")) {
-                    // Aciona o seu método no Principal que remove do pendingOrdersMap e limpa timestamps
-                    portfolioService.removePendingOrderById(clientOrderId);
-                    log.warn("🧹 [AUTO-HÍGIDE] Ordem {} removida do fluxo para normalizar o Buying Power.", clientOrderId);
-                } else {
-                    portfolioService.removePendingOrderById(String.valueOf(id));
-                }
+                portfolioService.removePendingOrderById(clientOrderId != null ? clientOrderId : String.valueOf(id));
 
-                // 2. 🛡️ LIMPEZA DE CACHE DA PONTE (Evita o acúmulo de lixo na memória)
-                com.ib.client.Order orderFalha = lastOrdersCache.remove(id); // .remove() já limpa e retorna o objeto
+                // 2. RECUPERAÇÃO DOS DADOS DA ORDEM QUE FALHOU
+                com.ib.client.Order orderFalha = lastOrdersCache.remove(id);
                 com.ib.client.Contract contractFalha = lastContractsCache.remove(id);
 
                 if (orderFalha != null && contractFalha != null) {
-                    // 3. 🎯 MITIGAÇÃO (Agora com o BP já liberado pelo passo 1)
-                    log.info("🔄 [RECOVERY] Iniciando tentativa de fragmentação para o ativo: {}", contractFalha.symbol());
-                    tentarReenvioComReducao(id, contractFalha, orderFalha);
+                    log.info("🎯 [RECOVERY] Executando protocolo 'ORDEM PELADA' para eliminar o ativo: {}", contractFalha.symbol());
+                    // CHAMADA PARA O NOVO MÉTODO DE LIQUIDAÇÃO TOTAL
+                    executarLiquidacaoTotalNaked(contractFalha, orderFalha);
                 } else {
-                    log.error("❌ [RECOVERY ABORT] Impossível mitigar: Ordem ID {} não encontrada nos caches da Ponte.", id);
+                    log.error("❌ [RECOVERY ABORT] Dados insuficientes nos caches para liquidar ativo do ID {}", id);
                 }
                 return;
             }
@@ -1134,17 +960,51 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
         }
     }
 
+    private void executarLiquidacaoTotalNaked(Contract contract, com.ib.client.Order order) {
+        String symbol = contract.symbol();
+        try {
+            // 🛡️ Delay tático para o Gateway respirar
+            Thread.sleep(1000);
 
+            log.warn("⚔️ [ORDEM-PELADA] Rejeição de margem em {}. Removendo blindagem para ejeção forçada.", symbol);
 
+            // --- 🛠️ DESPIMPA A ORDEM (Naked Transformation) ---
 
-    private void processarMitigacaoMargem(int id) {
-        com.ib.client.Order orderFalha = lastOrdersCache.get(id);
-        com.ib.client.Contract contractFalha = lastContractsCache.get(id);
+            // 1. Capturamos a referência original do Principal ANTES de limpar tudo
+            // Isso garante que o Principal consiga ouvir o retorno da execução MKT
+            String principalClientId = order.orderRef();
 
-        if (orderFalha != null && contractFalha != null) {
-            lastOrdersCache.remove(id);
-            lastContractsCache.remove(id);
-            tentarReenvioComReducao(id, contractFalha, orderFalha);
+            if (principalClientId == null || principalClientId.isEmpty() || principalClientId.equals("0")) {
+                // Fallback caso a referência esteja perdida no objeto
+                principalClientId = "RECOVERY-" + symbol + "-" + System.currentTimeMillis();
+            }
+
+            // 2. Transformação em Market Order (Alta prioridade)
+            order.orderType("MKT");
+            order.lmtPrice(Double.MAX_VALUE);
+            order.auxPrice(0.0); // 🔥 DESTRUIÇÃO DO STOP LOSS (Causa do bloqueio)
+
+            // 3. Limpeza de rastro de algoritmos e travas
+            order.trailingPercent(Double.MAX_VALUE);
+            order.trailStopPrice(Double.MAX_VALUE);
+            order.algoStrategy("");
+            order.algoParams(null);
+            order.transmit(true);
+            order.parentId(0);
+            order.ocaGroup("");
+
+            // --- 🚀 DISPARO VIA FLUXO EXISTENTE ---
+            log.info("📤📤📤📤 [RECOVERY-ENVIO] Submetendo Ordem Pelada para 📤📤📤📤{} via ID Principal: {}",
+                    symbol, principalClientId);
+
+            // Chamada ao seu método original: public void placeOrder(String principalClientId, Contract contract, Order order)
+            this.placeOrder(principalClientId, contract, order);
+
+            // Reseta o contador de falhas para este ativo pois a ordem final foi enviada
+            symbolFailureCounter.remove(symbol);
+
+        } catch (Exception e) {
+            log.error("💥 [Naked-Recovery] Falha crítica na manobra de ejeção de {}: {}", symbol, e.getMessage());
         }
     }
 
@@ -1236,13 +1096,25 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     @Override
     public void positionEnd() {
         try {
-            log.info("✅ Fim do recebimento de posições. Sincronizando {} posições com o PortfolioService.", tempPositions.size());
+            log.info("✅ [PONTE-SYNC] Fim do recebimento oficial. Sincronizando {} ativos com o PortfolioService.", tempPositions.size());
+
+            // 1. ENTREGA TÁTICA: Envia a verdade oficial da TWS para o cache mestre do Principal.
+            // Fazemos isso PRIMEIRO para que o cache consolidado esteja pronto.
             portfolioService.updatePortfolioPositions(new ArrayList<>(tempPositions));
+
+            // 2. LIMPEZA DE RASTRO: Agora que o cache oficial está atualizado,
+            // podemos resetar as memórias temporárias (Sombra e Buffer).
+            // Isso elimina qualquer "drift" (desvio) acumulado durante o caos da execução.
+            shadowPositions.clear();
             tempPositions.clear();
+
+            // 3. FINALIZAÇÃO: Notifica o sistema que o inventário está 100% íntegro.
             portfolioService.finalizePositionSync();
-            log.info("✅ Sincronização de posições concluída. (Sinergia OK)");
+
+            log.info("🧹 [SHADOW-CLEAN] Sincronia concluída. Memórias sombreadas resetadas e Cache oficial Soberano.");
+
         } catch (Exception e) {
-            log.error("💥 [PONTE | POSIÇÃO END] Falha CRÍTICA ao finalizar a sincronização de posições. Rastreando.", e);
+            log.error("💥 [PONTE | POSIÇÃO END] Falha CRÍTICA na consolidação do inventário: {}", e.getMessage());
         }
     }
 

@@ -213,6 +213,7 @@ public class IBKRController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
+
     @PostMapping("/place-order")
     public ResponseEntity<?> placeOrder(@RequestBody OrderDTO orderDto) {
         // 1. Log de entrada para rastreio de auditoria

@@ -1187,6 +1187,56 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
         return BridgeHealthStatus.OPERATIONAL;
     }
 
+    /**
+     * 🎯 MÉTODOTÁTICO: Retorna a quantidade exata de um ativo em custódia.
+     * Crucial para a Ponte decidir se o 'CLOSE' do Principal deve ser BUY ou SELL.
+     * @param symbol Ticker do ativo (ex: META)
+     * @return Quantidade (Negativa para SHORT, Positiva para LONG, ZERO se não houver)
+     */
+    public BigDecimal getPositionForSymbol(String symbol) {
+        if (symbol == null) {
+            log.error("⚠️ [AUDITORIA-POSICAO] Tentativa de consulta com Símbolo NULO.");
+            return BigDecimal.ZERO;
+        }
+
+        final String ticker = symbol.toUpperCase();
+
+        // Acessa o snapshot atômico do portfólio
+        Portfolio current = portfolioState.get();
+
+        if (current != null && current.openPositions() != null) {
+            Position pos = current.openPositions().get(ticker);
+
+            if (pos != null) {
+                BigDecimal qty = pos.getQuantity();
+                String regime = (qty.signum() < 0) ? "SHORT 🔴" : "LONG 🟢";
+
+                log.info("🎯 [AUDITORIA-POSICAO] {} identificado em custódia. Qtd: {} | Lado: {}",
+                        ticker, qty, regime);
+                return qty;
+            }
+        }
+
+        log.debug("⚪ [AUDITORIA-POSICAO] {} não encontrado no inventário ativo. Retornando ZERO.", ticker);
+        return BigDecimal.ZERO;
+    }
+
+    /**
+     * 🎯 CONSULTA HÍBRIDA: Tenta o cache atômico, mas permite fallback.
+     * Se o cache reporta zero, o sistema agora tem permissão para uma verificação de última instância.
+     */
+    public BigDecimal getConfirmedPositionForSymbol(String symbol) {
+        BigDecimal cachedQty = getPositionForSymbol(symbol); // [cite: 300, 304]
+
+        if (cachedQty.signum() != 0) {
+            return cachedQty;
+        }
+
+        // Se o cache está zerado, o problema pode ser o delay de sincronia (Poeira ou Warmup)
+        log.warn("🔍 [INQUISIÇÃO-POSICAO] Cache zerado para {}. O Despacho solicitará verificação direta.", symbol);
+        return BigDecimal.ZERO;
+    }
+
     // Método que fornece o Account ID (necessário para a validação)
     public String getAccountId() {
         return this.accountId;

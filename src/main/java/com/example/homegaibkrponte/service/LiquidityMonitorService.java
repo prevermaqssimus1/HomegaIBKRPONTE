@@ -41,7 +41,7 @@ public class LiquidityMonitorService {
      */
     @Scheduled(fixedRate = 300000)
     public void monitorLiquidity() {
-        log.info("⏰ [MONITOR-AUTO] Iniciando checagem programada de liquidez...");
+//        log.info("⏰ [MONITOR-AUTO] Iniciando checagem programada de liquidez...");
         try {
             // 🛑 AJUSTE CRÍTICO: Barreira de Sincronização na primeira execução (Fix para Race Condition)
             if (isInitialCheckDone.compareAndSet(false, true)) {
@@ -73,7 +73,7 @@ public class LiquidityMonitorService {
                 log.info("🔔 [MONITOR-AUTO] EL BAIXO: R$ {}. Abaixo do limite de conforto de R$ {}.",
                         currentEL.toPlainString(), WARNING_THRESHOLD.toPlainString());
             } else {
-                log.info("✅ [MONITOR-AUTO] EL SAUDÁVEL: R$ {}.", currentEL.toPlainString());
+//                log.info("✅ [MONITOR-AUTO] EL SAUDÁVEL: R$ {}.", currentEL.toPlainString());
             }
 
         } catch (InterruptedException e) {

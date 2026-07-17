@@ -728,7 +728,7 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
     public BigDecimal getExcessLiquidity() {
         // Usa a chave UPPERCASE consistente
         BigDecimal el = accountValuesCache.getOrDefault(KEY_EXCESS_LIQUIDITY, BigDecimal.ZERO);
-        log.debug("✅ [PONTE | GET EL] Retornando Excess Liquidity do cache SSOT: R$ {}", el.toPlainString());
+//        log.debug("✅ [PONTE | GET EL] Retornando Excess Liquidity do cache SSOT: R$ {}", el.toPlainString());
         return el;
     }
 
@@ -912,8 +912,8 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
                 ? PositionDirection.SHORT
                 : PositionDirection.LONG;
 
-        log.warn("📦 [PONTE-SYNC] {} | Qtd Recebida: {} | Direção Definida: {}",
-                dto.getTicker(), quantityWithSignal, direction);
+//        log.warn("📦 [PONTE-SYNC] {} | Qtd Recebida: {} | Direção Definida: {}",
+//                dto.getTicker(), quantityWithSignal, direction);
 
         return Position.builder()
                 .symbol(dto.getTicker())
@@ -1244,6 +1244,36 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
 
     public ConcurrentHashMap<String, BigDecimal> getAccountValuesCache() {
         return accountValuesCache;
+    }
+
+    // Adicione estes métodos dentro da sua classe LivePortfolioService (Ponte)
+
+
+    public BigDecimal getNetLiquidation() {
+        return accountValuesCache.getOrDefault(KEY_NET_LIQUIDATION, BigDecimal.ZERO);
+    }
+
+    public BigDecimal getCashBalance() {
+        return accountValuesCache.getOrDefault(KEY_CASH_BALANCE, BigDecimal.ZERO);
+    }
+
+
+    public BigDecimal getAvailableFunds() {
+        return accountValuesCache.getOrDefault(KEY_AVAILABLE_FUNDS, BigDecimal.ZERO);
+    }
+
+    /**
+     * 🛡️ ACESSO À MARGEM INICIAL (SSOT)
+     */
+    public BigDecimal getInitMarginReq() {
+        return accountValuesCache.getOrDefault(KEY_INIT_MARGIN, BigDecimal.ZERO);
+    }
+
+    /**
+     * 🛡️ ACESSO À MARGEM DE MANUTENÇÃO (SSOT)
+     */
+    public BigDecimal getMaintainMarginReq() {
+        return accountValuesCache.getOrDefault(KEY_MAINTAIN_MARGIN, BigDecimal.ZERO);
     }
 
     public BigDecimal getNlv() { return nlv.get(); }

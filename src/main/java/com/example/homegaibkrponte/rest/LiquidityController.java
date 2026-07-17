@@ -1,6 +1,7 @@
 package com.example.homegaibkrponte.rest;
 
 import com.example.homegaibkrponte.connector.IBKRConnector;
+import com.example.homegaibkrponte.dto.AccountStateDTO;
 import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -194,6 +195,33 @@ public class LiquidityController {
             // Retornar ZERO em caso de falha de serviço é o comportamento mais seguro
             // para forçar o VETO/Emergency Rescue Mode no sistema Principal.
             return ResponseEntity.status(500).body(BigDecimal.ZERO);
+        }
+    }
+
+    /**
+     * ✅ NOVO ENDPOINT: Estado Completo (SSOT)
+     * Fornece ao sistema Principal a visão atômica de todos os parâmetros de risco.
+     */
+    @GetMapping("/account/state")
+    public ResponseEntity<AccountStateDTO> getAccountState() {
+        try {
+            // Construção do DTO com os dados do seu SSOT interno (LivePortfolioService)
+            AccountStateDTO state = AccountStateDTO.builder()
+                    .netLiquidation(livePortfolioService.getNetLiquidation())
+                    .cashBalance(livePortfolioService.getCashBalance())
+                    .buyingPower(livePortfolioService.getCurrentBuyingPower())
+                    .excessLiquidity(livePortfolioService.getExcessLiquidity())
+                        .initMarginReq(livePortfolioService.getInitMarginReq())
+                        .maintainMarginReq(livePortfolioService.getMaintainMarginReq()) // <--- A MENSAGEM QUE FALTAVA
+                    .availableFunds(livePortfolioService.getAvailableFunds())
+                    .currency("BRL")
+                    .timestamp(java.time.Instant.now())
+                    .build();
+
+            return ResponseEntity.ok(state);
+        } catch (Exception e) {
+            log.error("❌ Falha ao montar AccountStateDTO completo", e);
+            return ResponseEntity.status(500).build();
         }
     }
 }

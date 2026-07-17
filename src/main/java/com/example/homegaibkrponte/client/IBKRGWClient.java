@@ -5,7 +5,9 @@ import com.example.homegaibkrponte.monitoring.LivePortfolioService;
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import java.math.BigDecimal;
+
 import lombok.RequiredArgsConstructor;
 
 /**
@@ -33,7 +35,6 @@ public class IBKRGWClient {
                     log.error("💥 [PONTE] Falha: Ordem LMT de {} requer preço válido.", symbol);
                     return new OrderExecutionResult(false, "Preço inválido.");
                 }
-
 
 
                 if (quantity <= 0) return new OrderExecutionResult(false, "Qtd inválida.");

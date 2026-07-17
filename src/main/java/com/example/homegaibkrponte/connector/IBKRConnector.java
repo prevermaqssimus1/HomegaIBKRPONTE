@@ -1081,7 +1081,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             // 🚀 AJUSTE DE HIGIENE: Usando a variável final para evitar o erro de compilação
             tempPositions.removeIf(p -> p.getTicker().equalsIgnoreCase(tickerFinal));
 
-            log.info("🎯 [PONTE-SINCRONIA] Posição REAL ativa: {} {} @ {}", quantity, tickerFinal, avgCost);
+//            log.info("🎯 [PONTE-SINCRONIA] Posição REAL ativa: {} {} @ {}", quantity, tickerFinal, avgCost);
 
             PositionDTO positionDto = new PositionDTO();
             positionDto.setTicker(tickerFinal);
@@ -1111,7 +1111,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
             // 3. FINALIZAÇÃO: Notifica o sistema que o inventário está 100% íntegro.
             portfolioService.finalizePositionSync();
 
-            log.info("🧹 [SHADOW-CLEAN] Sincronia concluída. Memórias sombreadas resetadas e Cache oficial Soberano.");
+//            log.info("🧹 [SHADOW-CLEAN] Sincronia concluída. Memórias sombreadas resetadas e Cache oficial Soberano.");
 
         } catch (Exception e) {
             log.error("💥 [PONTE | POSIÇÃO END] Falha CRÍTICA na consolidação do inventário: {}", e.getMessage());

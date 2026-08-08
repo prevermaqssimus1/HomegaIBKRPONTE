@@ -1097,7 +1097,7 @@ public class IBKRConnector implements MarketDataProvider, EWrapper, IBKRConnecto
     @Override
     public void positionEnd() {
         try {
-            log.info("✅ [PONTE-SYNC] Fim do recebimento oficial. Sincronizando {} ativos com o PortfolioService.", tempPositions.size());
+//            log.info("✅ [PONTE-SYNC] Fim do recebimento oficial. Sincronizando {} ativos com o PortfolioService.", tempPositions.size());
 
             // 1. ENTREGA TÁTICA: Envia a verdade oficial da TWS para o cache mestre do Principal.
             // Fazemos isso PRIMEIRO para que o cache consolidado esteja pronto.

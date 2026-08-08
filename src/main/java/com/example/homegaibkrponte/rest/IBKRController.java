@@ -205,7 +205,7 @@ public class IBKRController {
                 log.warn("⚠️ [PONTE] Falha ao disparar refresh de posições em background.");
             }
 
-            log.info("📡 [PONTE | API] Retornando {} posições via Cache (Latência Zero).", positions.size());
+//            log.info("📡 [PONTE | API] Retornando {} posições via Cache (Latência Zero).", positions.size());
             return ResponseEntity.ok(positions);
 
         } catch (Exception e) {
@@ -217,7 +217,7 @@ public class IBKRController {
     @PostMapping("/place-order")
     public ResponseEntity<?> placeOrder(@RequestBody OrderDTO orderDto) {
         // 1. Log de entrada para rastreio de auditoria
-        log.info("🛒🛒🛒🛒🛒🛒🛒 [PONTE] Recebida submissão: {} | Ativo: {} | Tipo: {} | Qtd: {}",
+        log.info("💥🛒🛒🛒🛒🛒🛒🛒💥 [PONTE] Recebida submissão: {} | Ativo: {} | Tipo: {} | Qtd: {}",
                 orderDto.clientOrderId(), orderDto.symbol(), orderDto.type(), orderDto.quantity());
 
         try {

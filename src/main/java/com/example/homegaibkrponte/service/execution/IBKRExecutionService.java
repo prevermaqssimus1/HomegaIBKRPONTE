@@ -79,9 +79,19 @@ public class IBKRExecutionService implements ExecutionService {
             // 3. Criar a Ordem IBKR
             // O orderId aqui pode ser 0 ou o próximo do connector,
             // pois o método final 'connector.placeOrder' irá sobrescrever com o ID numérico correto.
+            // ⚠️ CORREÇÃO CRÍTICA: antes usava order.side().toString(), que
+            // preserva o valor literal do enum (ex: "BUY_TO_COVER",
+            // "SELL_SHORT"). A API nativa da IBKR (com.ib.client.Order.action)
+            // só aceita os literais "BUY" ou "SELL" — qualquer outro valor é
+            // inválido/rejeitado. O modelo Order já tem os métodos corretos
+            // isCompra()/isVenda() (que tratam BUY_TO_COVER como compra e
+            // SELL_SHORT como venda), mas eles não eram usados aqui. Isso
+            // quebraria silenciosamente todo fechamento/aumento de posição
+            // SHORT ao chegar na API real.
+            String acaoReal = order.isCompra() ? "BUY" : "SELL";
             com.ib.client.Order ibkrOrder = orderMapper.mapToIbkrOrder(
                     0, // ID temporário
-                    order.side().toString(),
+                    acaoReal,
                     order.quantity()
             );
 

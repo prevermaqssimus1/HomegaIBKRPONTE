@@ -707,7 +707,7 @@ public class LivePortfolioService implements AccountStateProvider { // <<== IMPL
                 .build()
         );
 
-        log.warn("SINERGIA: Posições sincronizadas. {} Posições Abertas.", newPositionsMap.size());
+//        log.warn("SINERGIA: Posições sincronizadas. {} Posições Abertas.", newPositionsMap.size());
     }
 
     public void finalizePositionSync() {

@@ -41,8 +41,18 @@ public class IBKRMapperImpl implements IBKRMapper {
     public com.ib.client.Order toIBKROrder(Order domainOrder) {
         com.ib.client.Order ibkrOrder = new com.ib.client.Order();
 
+        // ⚠️ CORREÇÃO CRÍTICA: antes usava domainOrder.quantity().signum() > 0
+        // para inferir BUY/SELL — mas o modelo Order já tem um campo `side`
+        // explícito e confiável (com isCompra()/isVenda() já tratando
+        // BUY_TO_COVER como compra e SELL_SHORT como venda). Inferir pelo
+        // sinal da quantidade é redundante e perigoso: se quantity() vier
+        // sempre como magnitude positiva (dependendo de como o Principal
+        // normalizou antes de enviar), essa inferência SEMPRE resultaria em
+        // "BUY", mesmo para ordens de venda/short — o que faria TODA ordem
+        // que passasse por aqui (incluindo bracket orders inteiros) sair com
+        // o lado físico errado.
         // Configurações Base
-        ibkrOrder.action(domainOrder.quantity().signum() > 0 ? "BUY" : "SELL");
+        ibkrOrder.action(domainOrder.isCompra() ? "BUY" : "SELL");
         ibkrOrder.totalQuantity(Decimal.get(domainOrder.quantity().abs()));
         ibkrOrder.account(orderIdManager.getAccountId());
 
@@ -69,7 +79,12 @@ public class IBKRMapperImpl implements IBKRMapper {
         parent.transmit(false);
         bracket.add(parent);
 
-        String exitAction = parent.getAction().equals("BUY") ? "SELL" : "BUY";
+        // ⚠️ CORREÇÃO: antes derivava exitAction do resultado de
+        // parent.getAction() (que dependia do toIBKROrder já estar certo).
+        // Agora deriva diretamente de domainOrder.isCompra(), removendo
+        // qualquer dependência frágil entre os dois métodos — a ação de
+        // saída (stop loss/take profit) é sempre o oposto físico da entrada.
+        String exitAction = domainOrder.isCompra() ? "SELL" : "BUY";
 
         // 2. FILHA: STOP LOSS (Contingência)
         if (domainOrder.stopLossPrice() != null && domainOrder.stopLossPrice().signum() > 0) {

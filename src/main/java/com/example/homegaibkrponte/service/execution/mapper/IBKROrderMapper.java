@@ -38,7 +38,17 @@ public class IBKROrderMapper {
         ibkrOrder.account(targetPosition.getAccount());
         ibkrOrder.clientId(emergencyOrder.getClientId().hashCode());
         ibkrOrder.orderRef(emergencyOrder.getClientOrderId());
-        ibkrOrder.action(emergencyOrder.getSide().toString());
+        // ⚠️ CORREÇÃO CRÍTICA: mesmo padrão de bug do executeNewOrder — antes
+        // usava emergencyOrder.getSide().toString(), que preserva o valor
+        // literal do enum OrderSide (4 valores: BUY, SELL, BUY_TO_COVER,
+        // SELL_SHORT). A API nativa da IBKR (com.ib.client.Order.action) só
+        // aceita os literais "BUY" ou "SELL". Uma ordem de resgate de
+        // emergência que feche/aumente uma posição SHORT (BUY_TO_COVER ou
+        // SELL_SHORT) quebraria silenciosamente ao chegar na API real —
+        // exatamente no cenário mais crítico (liquidação de emergência).
+        boolean isCompraReal = emergencyOrder.getSide() == com.example.homegaibkrponte.domain.OrderSide.BUY
+                || emergencyOrder.getSide() == com.example.homegaibkrponte.domain.OrderSide.BUY_TO_COVER;
+        ibkrOrder.action(isCompraReal ? "BUY" : "SELL");
         ibkrOrder.orderType(DEFAULT_ORDER_TYPE);
         ibkrOrder.tif(DEFAULT_TIF);
         ibkrOrder.cashQty(liquidacaoTotalValor.doubleValue());

@@ -132,7 +132,11 @@ public class IBKRConnectorImpl implements com.example.homegaibkrponte.client.IBK
         parent.transmit(false);
         bracket.add(parent);
 
-        String exitAction = parent.getAction().equals("BUY") ? "SELL" : "BUY";
+        // ⚠️ CORREÇÃO: deriva exitAction diretamente de domainOrder.isCompra()
+        // em vez de depender do resultado de parent.getAction() — mesmo já
+        // corrigido via toIBKROrder (que agora usa isCompra() corretamente),
+        // isso remove a dependência frágil entre os dois métodos.
+        String exitAction = domainOrder.isCompra() ? "SELL" : "BUY";
 
         if (domainOrder.stopLossPrice() != null && domainOrder.stopLossPrice().signum() > 0) {
             Order stopLoss = new Order();
